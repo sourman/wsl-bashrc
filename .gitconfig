@@ -1,0 +1,67 @@
+[user]
+	name = Ahmed Mansour
+	email = ahmed.om@gmail.com
+[alias]
+	dbr = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
+	amend = commit --amend
+	meez = diff --color-words
+	meg = diff --color-words --cached
+	stat = diff --stat
+	brnach = !git branch
+	branhc = !git branch
+	stauts = status
+	nrach = branch
+	brnahc = branch
+	comm8t = commit
+	commnit = commit
+	comti = commit
+	commti = commit
+	statsus = status
+	stuastsu = status
+	staustu = status
+	stustua = status
+	statusu = status
+	stastus = status
+	statsu = status
+	stats = status
+	witch = switch
+	swithc = switch
+	stuats = status
+	statis = status
+	rbanch = branch
+	stuatus = status
+	staus = status
+	siwtch = switch
+	siwthc = switch
+	stasu = status
+	statuas = status
+[core]
+	safecrlf = false
+	autocrlf = input
+	editor = vim
+[color]
+    ui = auto
+[color "branch"]
+    current = yellow bold
+    local = green bold
+    remote = cyan bold
+[color "diff"]
+    meta = yellow bold
+    frag = magenta bold
+    old = red bold
+    new = green bold
+[maintenance]
+	repo = /home/ahmed/lin/loomli-super/app-subdomain
+	repo = /home/ahmed/lin/loomli-super/frontend
+	repo = /home/ahmed/lin/loomli-super/video-composer
+[init]
+	defaultBranch = master
+[filter "lfs"]
+	process = git-lfs filter-process
+	required = true
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+[pull]
+	rebase = false

@@ -1,0 +1,17 @@
+alias wifi='powershell.exe -ExecutionPolicy Bypass -File "C:\Users\User\workspace\wifi-auto-login\wifi-manual-login.ps1"'
+alias gut="git"
+alias got="git"
+alias gitt="git"
+alias giot='git'
+alias igt='git'
+alias gti='git'
+alias giot='git'
+alias docke='docker'
+alias dockerr='docker'
+alias docer='docker'
+alias dockeg='docker'
+alias dockef='docker'
+alias docked='docker'
+alias docket='docker'
+alias supabase='npx supabase'
+torok() { repo="$(basename "$(pwd)")"; cd ~/.cursor/worktrees/"${repo}__WSL__Ubuntu_/"; }
