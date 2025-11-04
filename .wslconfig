@@ -1,0 +1,10 @@
+# This file should be in the user home directory in WINDOWS NOT WSL.
+# Keeping here to track in git
+[wsl2]
+memory=8000MB
+processors=4
+localhostForwarding=true
+dnsTunneling=true
+
+[experimental]
+sparseVhd=true
