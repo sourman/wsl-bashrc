@@ -1,0 +1,63 @@
+{
+  "window.commandCenter": true,
+  "cursor.cpp.enablePartialAccepts": true,
+  "cursor.composer.shouldAutoScrollToBottom": false,
+  "cursor.diffs.useCharacterLevelDiffs": true,
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "vscode.typescript-language-features"
+  },
+  "explorer.confirmDragAndDrop": false,
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  "explorer.confirmDelete": false,
+  "terminal.integrated.enableMultiLinePasteWarning": "never",
+  "tailwind-fold.foldStyle": "QUOTES",
+  "tailwind-fold.showTailwindImage": false,
+  "tailwind-fold.foldLengthThreshold": 50,
+  "editor.formatOnSave": true,
+  "tailwindCSS.emmetCompletions": true,
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "editor.rulers": [80, 100],
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "sklearn",
+      "depth": 2
+    },
+    {
+      "name": "matplotlib",
+      "depth": 2
+    },
+    {
+      "name": "scipy",
+      "depth": 2
+    },
+    {
+      "name": "django",
+      "depth": 2
+    },
+    {
+      "name": "flask",
+      "depth": 2
+    },
+    {
+      "name": "fastapi",
+      "depth": 2
+    },
+    {
+      "name": "supabase",
+      "depth": 5,
+      "includeAllSymbols": true
+    }
+  ],
+  "eslint.workingDirectories": ["./app-subdomain", "./frontend"],
+  "workbench.editor.wrapTabs": true,
+  "workbench.colorTheme": "Kimbie Dark",
+  "files.autoSave": "afterDelay",
+  "cursor.composer.shouldAllowCustomModes": true,
+  "cursor.composer.shouldChimeAfterChatFinishes": true,
+  "diffEditor.maxComputationTime": 0,
+  "tailwind-fold.unfoldIfLineSelected": true,
+  "update.releaseTrack": "prerelease",
+  "remote.autoForwardPortsSource": "hybrid",
+  "window.restoreWindows": "none",
+  "window.restoreFullscreen": true
+}
