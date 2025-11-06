@@ -1,0 +1,90 @@
+---
+description: how to query Supabase edge function logs using SQL
+alwaysApply: false
+---
+
+# Querying Supabase Edge Function Logs
+
+Supabase stores edge function logs in queryable database tables. You can use SQL to retrieve logs for debugging and monitoring.
+
+## Available Log Tables
+
+1. **`function_logs`** - Contains console output from edge functions (console.log, console.error, etc.)
+   - Includes: timestamp, identifier (function name), level, message, metadata
+   
+2. **`function_edge_logs`** - Contains network request/response metadata for each edge function invocation
+   - Includes: timestamp, identifier, method, status_code, path, execution_time_ms
+
+## Using Supabase MCP to Query Logs
+
+**Use the Supabase MCP** (Model Context Protocol) tools to execute SQL queries directly.
+
+Use the `mcp_supabase_execute_sql` tool to run SQL queries against the log tables:
+
+```typescript
+// Example: Query logs for a specific function
+mcp_supabase_execute_sql({
+  query: `
+    SELECT *
+    FROM function_logs
+    WHERE identifier = 'function-name'
+      AND timestamp >= NOW() - INTERVAL '15 minutes'
+    ORDER BY timestamp DESC;
+  `
+})
+```
+
+The MCP tools provide direct access to your Supabase database without needing external SQL clients or the Dashboard. This is the recommended approach for programmatic log queries and debugging workflows.
+
+## Common Query Patterns
+
+### Get console logs for a specific function (last 15 minutes)
+```sql
+SELECT *
+FROM function_logs
+WHERE identifier = 'function-name'
+  AND timestamp >= NOW() - INTERVAL '15 minutes'
+ORDER BY timestamp DESC;
+```
+
+### Get network logs for a specific function (last 15 minutes)
+```sql
+SELECT *
+FROM function_edge_logs
+WHERE identifier = 'function-name'
+  AND timestamp >= NOW() - INTERVAL '15 minutes'
+ORDER BY timestamp DESC;
+```
+
+### Get error logs only
+```sql
+SELECT *
+FROM function_logs
+WHERE identifier = 'function-name'
+  AND level = 'error'
+  AND timestamp >= NOW() - INTERVAL '1 hour'
+ORDER BY timestamp DESC;
+```
+
+### Get logs with execution time analysis
+```sql
+SELECT 
+  identifier,
+  COUNT(*) as invocation_count,
+  AVG(execution_time_ms) as avg_execution_time_ms,
+  MIN(execution_time_ms) as min_execution_time_ms,
+  MAX(execution_time_ms) as max_execution_time_ms,
+  SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as error_count
+FROM function_edge_logs
+WHERE timestamp >= NOW() - INTERVAL '1 hour'
+GROUP BY identifier
+ORDER BY invocation_count DESC;
+```
+
+## When to Use
+
+- Debugging edge function failures
+- Monitoring function performance
+- Analyzing error patterns
+- Tracking function invocation frequency
+- Investigating timeout or performance issues
