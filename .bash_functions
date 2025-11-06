@@ -80,14 +80,20 @@ mawet() {
     return 0
   fi
     
-  # Collect all PIDs from all files
+  # Collect all PIDs and process groups from all files
   all_pids=()
+  all_pgroups=()
   while IFS= read -r pid_file; do
     if [ -f "$pid_file" ]; then
       echo "Reading PIDs from: $pid_file"
       while IFS= read -r pid; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
           all_pids+=("$pid")
+          # Get process group ID
+          pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+          if [ -n "$pgid" ]; then
+            all_pgroups+=("$pgid")
+          fi
         fi
       done < "$pid_file"
       
@@ -102,16 +108,29 @@ mawet() {
     fi
   done <<< "$pid_files"
   
-  # Kill all PIDs
-  if [ ${#all_pids[@]} -eq 0 ]; then
-    echo "No active processes found"
+  # Kill all process groups (which includes child processes like Vite)
+  if [ ${#all_pgroups[@]} -eq 0 ]; then
+    echo "No active process groups found"
   else
-    echo "Killing ${#all_pids[@]} processes: ${all_pids[*]}"
-    kill "${all_pids[@]}" 2>/dev/null
+    # Remove duplicates
+    unique_pgroups=($(printf "%s\n" "${all_pgroups[@]}" | sort -u))
+    echo "Killing ${#unique_pgroups[@]} process groups: ${unique_pgroups[*]}"
+    
+    for pgid in "${unique_pgroups[@]}"; do
+      # Kill the entire process group
+      if kill -- "-$pgid" 2>/dev/null; then
+        echo "Killed process group $pgid"
+      else
+        echo "Failed to kill process group $pgid, trying individual PIDs"
+      fi
+    done
+    
     sleep 2
+    
+    # Fallback: kill any remaining individual PIDs
     for pid in "${all_pids[@]}"; do
       if kill -0 "$pid" 2>/dev/null; then
-        echo "Force killing PID $pid"
+        echo "Force killing remaining PID $pid"
         kill -9 "$pid" 2>/dev/null
       fi
     done
