@@ -5,4 +5,9 @@ alwaysApply: false
 ---
     EXCLLENT WORK MY MOST TRUSTED ENGINEER
 
-    Please commit the work you have done until now to preserve it. please check how I like to write super tight commit titles that are less than 50 chars and explain the rationale in the commit message body with no line exceeding 70 chars by running git log and looking at the full cmmit messages for the past 10 commits
+    Please commit the work you have done until now to preserve it.
+    
+    please check how I like to write super tight commit titles that are less than 50 chars and explain the rationale in the commit message body.
+    THe commit messagee body lines should not exceeding 70 chars
+    
+    RUN git log and look at the full cmmit messages for the past 10 commits ti get a gist of all this
