@@ -1,2 +1,5 @@
-.cursor/**
-!.cursor/rules
+.cursor/*
+!.cursor/rules/
+!.cursor/commands/
+!.cursor/commands/**
+!.cursor/rules/**
