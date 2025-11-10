@@ -142,3 +142,9 @@ mawet() {
   rm -f /tmp/worktree-pids-*.map
   rm -f /tmp/worktree-pids-*.details
 }
+
+kayes() {
+  f="$1"; tag="$2"
+  { echo "<$tag>"; cat "$f"; echo "</$tag>"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
