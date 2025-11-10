@@ -35,6 +35,7 @@
 	siwthc = switch
 	stasu = status
 	statuas = status
+	cache = diff --stat --cached
 [core]
 	safecrlf = false
 	autocrlf = input
