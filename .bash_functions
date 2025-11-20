@@ -148,3 +148,4 @@ kayes() {
   { echo "<$tag>"; cat "$f"; echo "</$tag>"; } > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
+rukn() { npx supabase migration list | tail -${1:-5}; }
