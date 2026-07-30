@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+# ebox — E2B boxes with human names, multi-base carbon-copies (chad-style).
+# Does NOT touch `box` or `wt`.
+#
+#   ebox                      no .ebox.toml → init wizard; else fzf → console
+#   ebox new <name>           fzf parent (bases | boxes | seeds) → create
+#   ebox base [box] [--as N]  bless box snapshot as named project base
+#   ebox default <base>       set default_base in .ebox.toml
+#   ebox ls / url / open / proxy / pause / wake / console / rm / id
+#
+# Idle: timeout → pause (kept forever, free). ebox rm = kill forever.
+set -euo pipefail
+
+EBOX_DIR="${EBOX_DIR:-$HOME/.config/ebox}"
+EBOX_REGISTRY="${EBOX_REGISTRY:-$EBOX_DIR/registry.json}"
+EBOX_PY="${EBOX_PY:-$HOME/.local/share/ebox/venv/bin/python}"
+EBOX_API="${EBOX_API:-$HOME/.local/share/ebox/ebox_api.py}"
+EBOX_TIMEOUT="${EBOX_TIMEOUT:-600}"
+EBOX_APP_PORT="${EBOX_APP_PORT:-8080}"
+# Optional override (e.g. export EBOX_DNS_ZONE=foo.test). Default: <main-repo>.test
+# or <cwd-basename>.test when not in git. Never uses a linked worktree folder name.
+EBOX_CADDY_ROUTES="${EBOX_CADDY_ROUTES:-/etc/caddy/ebox-routes.caddy}"
+EBOX_TOML_NAME="${EBOX_TOML_NAME:-.ebox.toml}"
+
+die() { echo "ebox: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+_ebox_ensure() {
+  mkdir -p "$EBOX_DIR"
+  [ -f "$EBOX_REGISTRY" ] || echo '{}' >"$EBOX_REGISTRY"
+  [ -x "$EBOX_PY" ] || die "missing $EBOX_PY"
+  [ -f "$EBOX_API" ] || die "missing $EBOX_API"
+  need e2b
+  need jq
+  need fzf
+}
+
+_ebox_api() { "$EBOX_PY" "$EBOX_API" "$@"; }
+
+# Linked worktree path (may be ~/.cursor/worktrees/cora/feat-x).
+_ebox_git_toplevel() {
+  git rev-parse --show-toplevel 2>/dev/null || true
+}
+
+# Primary repo checkout path (parent of .git), NOT a worktree leaf name.
+_ebox_main_repo_root() {
+  local common
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  common="${common%/}"
+  if [[ "$common" == */.git ]]; then
+    dirname "$common"
+  else
+    # Unusual layouts — best effort
+    dirname "$common"
+  fi
+}
+
+# DNS apex label: main git folder name, else cwd basename. Worktree-safe.
+_ebox_dns_apex() {
+  local root
+  if [ -n "${EBOX_DNS_ZONE:-}" ]; then
+    # full zone override → apex is zone without .test if present
+    printf '%s' "${EBOX_DNS_ZONE%.test}"
+    return 0
+  fi
+  root="$(_ebox_main_repo_root 2>/dev/null)" || root=""
+  if [ -z "$root" ]; then
+    root="$PWD"
+  fi
+  _ebox_slug "$(basename "$root")"
+}
+
+_ebox_dns_zone() {
+  if [ -n "${EBOX_DNS_ZONE:-}" ]; then
+    printf '%s' "$EBOX_DNS_ZONE"
+    return 0
+  fi
+  printf '%s.test' "$(_ebox_dns_apex)"
+}
+
+# .ebox.toml: prefer current worktree copy if present, else main checkout, else create path.
+_ebox_toml_path() {
+  local wt main
+  wt="$(_ebox_git_toplevel)"
+  main="$(_ebox_main_repo_root 2>/dev/null)" || main=""
+  if [ -n "$wt" ] && [ -f "$wt/$EBOX_TOML_NAME" ]; then
+    printf '%s/%s' "$wt" "$EBOX_TOML_NAME"
+  elif [ -n "$main" ] && [ -f "$main/$EBOX_TOML_NAME" ]; then
+    printf '%s/%s' "$main" "$EBOX_TOML_NAME"
+  elif [ -n "$wt" ]; then
+    printf '%s/%s' "$wt" "$EBOX_TOML_NAME"
+  elif [ -n "$main" ]; then
+    printf '%s/%s' "$main" "$EBOX_TOML_NAME"
+  else
+    return 1
+  fi
+}
+
+_ebox_has_project() {
+  local p
+  p="$(_ebox_toml_path 2>/dev/null)" || return 1
+  [ -f "$p" ]
+}
+
+_ebox_project_json() {
+  local p
+  p="$(_ebox_toml_path)" || die "not inside a git repo — ebox project config lives at repo root"
+  [ -f "$p" ] || die "no $EBOX_TOML_NAME — run: ebox"
+  _ebox_api project get "$p"
+}
+
+_ebox_names() { jq -r 'keys[]' "$EBOX_REGISTRY" 2>/dev/null | sort; }
+
+_ebox_get() {
+  local name="$1" field="${2:-}"
+  if [ -n "$field" ]; then
+    jq -r --arg n "$name" --arg f "$field" '.[$n][$f] // empty' "$EBOX_REGISTRY"
+  else
+    jq -c --arg n "$name" '.[$n] // empty' "$EBOX_REGISTRY"
+  fi
+}
+
+_ebox_put() {
+  local name="$1" json="$2" tmp
+  tmp="$(mktemp)"
+  jq --arg n "$name" --argjson v "$json" '.[$n]=$v' "$EBOX_REGISTRY" >"$tmp"
+  mv "$tmp" "$EBOX_REGISTRY"
+}
+
+_ebox_del() {
+  local name="$1" tmp
+  tmp="$(mktemp)"
+  jq --arg n "$name" 'del(.[$n])' "$EBOX_REGISTRY" >"$tmp"
+  mv "$tmp" "$EBOX_REGISTRY"
+}
+
+_ebox_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+# Per-box zone (stored at create). Legacy entries fall back to current context zone.
+_ebox_zone_for() {
+  local name="$1" z
+  z="$(_ebox_get "$name" dns_zone)"
+  if [ -n "$z" ]; then
+    printf '%s' "$z"
+  else
+    _ebox_dns_zone
+  fi
+}
+
+_ebox_friendly_host() {
+  local name="$1"
+  printf '%s.%s' "$(_ebox_slug "$name")" "$(_ebox_zone_for "$name")"
+}
+_ebox_friendly_url() { printf 'https://%s' "$(_ebox_friendly_host "$1")"; }
+_ebox_upstream() {
+  local sid="$1" port="${2:-$EBOX_APP_PORT}"
+  printf 'https://%s-%s.e2b.app' "$port" "$sid"
+}
+EBOX_VNC_PORT="${EBOX_VNC_PORT:-6080}"
+
+# Desktop boxes: template/seed "desktop" (and snapshot forks of those bases).
+_ebox_is_desktop() {
+  local name="$1" ref seed
+  ref="$(jq -r --arg n "$name" '.[$n].source.ref // empty' "$EBOX_REGISTRY" 2>/dev/null)"
+  if [ "$ref" = "desktop" ]; then
+    return 0
+  fi
+  if _ebox_has_project 2>/dev/null; then
+    seed="$(
+      _ebox_project_json 2>/dev/null | jq -r --arg n "$name" --arg ref "$ref" '
+        .bases
+        | to_entries[]
+        | select(
+            (.value.seed // "") == "desktop"
+            and (
+              .value.source_box == $n
+              or .value.snapshot == $ref
+              or .key == $n
+            )
+          )
+        | .value.seed
+        | select(. == "desktop")
+      ' 2>/dev/null | head -n1
+    )"
+    [ "$seed" = "desktop" ] && return 0
+  fi
+  return 1
+}
+
+_ebox_vnc_friendly_host() {
+  local name="$1"
+  printf '%s-vnc.%s' "$(_ebox_slug "$name")" "$(_ebox_zone_for "$name")"
+}
+
+_ebox_vnc_upstream() {
+  local sid="$1"
+  _ebox_upstream "$sid" "$EBOX_VNC_PORT"
+}
+
+# Friendly noVNC URL when desktop; empty otherwise.
+_ebox_vnc_url() {
+  local name="$1" sid
+  _ebox_is_desktop "$name" || { printf ''; return 0; }
+  sid="$(_ebox_get "$name" sandbox_id)"
+  [ -n "$sid" ] || { printf ''; return 0; }
+  printf 'https://%s/vnc.html?autoconnect=true&resize=scale' "$(_ebox_vnc_friendly_host "$name")"
+}
+
+
+_ebox_live_json() {
+  e2b sbx list -s running,paused -f json 2>/dev/null || echo '[]'
+}
+
+_ebox_state_for() {
+  local sid="$1" live="${2:-}"
+  [ -n "$live" ] || live="$(_ebox_live_json)"
+  jq -r --arg id "$sid" '
+    if type=="array" then
+      (map(select(.sandboxID==$id or .sandboxId==$id))[0].state // "missing")
+    else "missing" end
+  ' <<<"$live" | tr '[:upper:]' '[:lower:]'
+}
+
+_ebox_fzf() {
+  # stdin: display\tvalue lines; optional header via EBOX_FZF_HEADER
+  local prompt="${1:-ebox> }" had_ble=0 picked
+  if [[ ${BLE_VERSION-} ]] && declare -F ble/decode/detach >/dev/null 2>&1; then
+    had_ble=1; ble/decode/detach
+  fi
+  picked="$(fzf --prompt="$prompt" --height=50% --reverse --delimiter=$'\t' \
+    --with-nth=1 ${EBOX_FZF_HEADER:+--header="$EBOX_FZF_HEADER"} \
+    | awk -F'\t' '{print $2}')" || true
+  if (( had_ble )) && declare -F ble/decode/attach >/dev/null 2>&1; then
+    ble/decode/attach
+  fi
+  [ -n "$picked" ] || return 1
+  printf '%s' "$picked"
+}
+
+_ebox_pick_box() {
+  local query="${1:-}" names matches count live
+  names="$(_ebox_names)"
+  [ -n "$names" ] || die "no eboxes — try: ebox new <name>"
+  if [ -n "$query" ]; then
+    matches="$(printf '%s\n' "$names" | awk -v q="$query" 'index($0,q)')"
+    count="$(printf '%s\n' "$matches" | grep -c . || true)"
+    if [ "$count" -eq 1 ]; then
+      printf '%s' "$matches"
+      return 0
+    elif [ "$count" -eq 0 ]; then
+      die "no ebox matches '$query'"
+    fi
+  fi
+  live="$(_ebox_live_json)"
+  local rows="" n sid st vnc
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    sid="$(_ebox_get "$n" sandbox_id)"
+    st="$(_ebox_state_for "$sid" "$live")"
+    vnc="$(_ebox_vnc_url "$n")"
+    [ -n "$vnc" ] || vnc="-"
+    # NOTE: $(...) strips trailing newlines — append $'\n' outside or rows glue together
+    rows+="$(printf '%-16s %-8s %-28s %s	%s' "$n" "$st" "$(_ebox_friendly_url "$n")" "$vnc" "$n")"$'\n'
+  done <<<"$names"
+  EBOX_FZF_HEADER='NAME  STATE  URL  VNC' _ebox_fzf 'ebox> ' <<<"$rows"
+}
+
+_ebox_resolve_id() {
+  local name="$1" sid
+  sid="$(_ebox_get "$name" sandbox_id)"
+  [ -n "$sid" ] || die "unknown ebox '$name'"
+  printf '%s' "$sid"
+}
+
+_ebox_register_created() {
+  local created="$1" name zone
+  name="$(jq -r .name <<<"$created")"
+  zone="$(_ebox_dns_zone)"
+  local reg
+  reg="$(jq -n --argjson c "$created" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg zone "$zone" \
+    '$c + {created_at:$now, dns_zone:$zone}')"
+  _ebox_put "$name" "$reg"
+  cmd_proxy >/dev/null 2>&1 || echo "ebox: warning: ebox proxy failed — run: ebox proxy" >&2
+}
+
+_ebox_print_ready() {
+  local name="$1" created="$2"
+  echo
+  echo "✓ ebox '$name' ready"
+  echo "  id   $(jq -r .sandbox_id <<<"$created")"
+  echo "  URL  $(_ebox_friendly_url "$name")"
+  local vnc
+  vnc="$(_ebox_vnc_url "$name")"
+  [ -n "$vnc" ] && echo "  VNC  $vnc"
+  echo "  TTY  ebox console $name"
+  echo "  base ebox base $name --as <base-name>   # bless as project carbon-copy"
+}
+
+# ── parent picker for ebox new: bases | boxes | seeds ───────────────────────
+# prints: kind|ref   (kind = base|box|seed)
+_ebox_pick_parent() {
+  local proj="{}" rows="" live default="" 
+  if _ebox_has_project; then
+    proj="$(_ebox_project_json)"
+    default="$(jq -r '.default_base // empty' <<<"$proj")"
+  fi
+  live="$(_ebox_live_json)"
+
+  # bases
+  if [ "$(jq '.bases|length' <<<"$proj")" != "0" ]; then
+    local b mark snap
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      snap="$(jq -r --arg b "$b" '.bases[$b].snapshot' <<<"$proj")"
+      mark=""
+      [ "$b" = "$default" ] && mark=" (default)"
+      rows+="$(printf 'base  %-20s snap %s%s\tbase|%s' "$b" "${snap:0:24}…" "$mark" "$b")"$'\n'
+    done < <(jq -r '.bases|keys[]' <<<"$proj")
+  fi
+
+  # boxes
+  local n sid st
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    sid="$(_ebox_get "$n" sandbox_id)"
+    st="$(_ebox_state_for "$sid" "$live")"
+    rows+="$(printf 'box   %-20s %-8s %s\tbox|%s' "$n" "$st" "$(_ebox_friendly_url "$n")" "$n")"$'\n'
+  done < <(_ebox_names)
+
+  # seeds
+  local tpls
+  tpls="$(_ebox_api list_templates)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rows+="$line"$'\n'
+  done < <(jq -r '
+    (.public + .private)[] |
+    "seed  \(.name|tostring|.[0:20])  \(.access)  \(.hint // "")\tseed|\(.id)"
+  ' <<<"$tpls")
+
+  [ -n "$rows" ] || die "nothing to fork from — run ebox (init) first"
+  EBOX_FZF_HEADER='KIND  NAME  DETAIL' _ebox_fzf 'parent> ' <<<"$rows"
+}
+
+# ── init wizard ─────────────────────────────────────────────────────────────
+cmd_init() {
+  _ebox_ensure
+  local toml main_root
+  main_root="$(_ebox_main_repo_root 2>/dev/null)" || main_root=""
+  [ -n "$main_root" ] || [ -n "$(_ebox_git_toplevel)" ] \
+    || die "init requires a git repo (cd into the project)"
+  toml="$(_ebox_toml_path)" || die "init requires a git repo"
+  if [ -f "$toml" ]; then
+    die "$EBOX_TOML_NAME already exists — ebox new / ebox base"
+  fi
+
+  echo "› no $EBOX_TOML_NAME — create first project base"
+  echo "  DNS zone: $(_ebox_dns_zone)  (from main repo: $(basename "${main_root:-$(_ebox_git_toplevel)}") )"
+  local tpls seed_id base_name box_name
+  tpls="$(_ebox_api list_templates)"
+  local rows=""
+  rows="$(jq -r '
+    (.public + .private)[] |
+    "\(.access)  \(.name)\t\(.id)\t\(.hint // "")\t\(.id)"
+  ' <<<"$tpls" | awk -F'\t' '{printf "%-10s %-36s %s\t%s\n", $1, $2, $3, $4}')"
+  seed_id="$(EBOX_FZF_HEADER='ACCESS  TEMPLATE  HINT' _ebox_fzf 'seed> ' <<<"$rows")" \
+    || die "cancelled"
+  echo "  seed: $seed_id"
+
+  local default_base
+  default_base="$(_ebox_dns_apex)"
+  if [ -t 0 ]; then
+    read -r -p "  base name [$default_base]: " base_name || true
+  fi
+  base_name="${base_name:-$default_base}"
+  [[ "$base_name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "bad base name: $base_name"
+  box_name="$base_name"
+  if [ -n "$(_ebox_get "$box_name" sandbox_id)" ]; then
+    die "ebox '$box_name' already exists in registry — pick another base name"
+  fi
+
+  _ebox_api project init "$toml" >/dev/null
+  local created snap
+  echo "› creating box '$box_name' from seed '$seed_id'…"
+  created="$(_ebox_api create "$box_name" --template "$seed_id" \
+    --timeout "$EBOX_TIMEOUT" --port "$EBOX_APP_PORT" --stub-web 1)"
+  _ebox_register_created "$created"
+  echo "› snapshotting as base '$base_name'…"
+  snap="$(_ebox_api snapshot "$(jq -r .sandbox_id <<<"$created")" --name "$base_name")"
+  _ebox_api project set-base "$toml" "$base_name" "$(jq -r .snapshot_id <<<"$snap")" \
+    --source-box "$box_name" --seed "$seed_id" --default >/dev/null
+
+  _ebox_print_ready "$box_name" "$created"
+  echo
+  echo "  project: $toml"
+  echo "  default base: $base_name"
+  echo "  customize this box, then:  ebox base $box_name --as $base_name"
+  echo "  fork:                      ebox new <leaf-name>"
+}
+
+# ── new ─────────────────────────────────────────────────────────────────────
+cmd_new() {
+  _ebox_ensure
+  local name="${1:-}" from="" timeout="$EBOX_TIMEOUT" port="$EBOX_APP_PORT"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      *) die "usage: ebox new <name> [--from base:NAME|box:NAME|seed:ID]" ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: ebox new <name>"
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "name must be lowercase kebab"
+  [ -z "$(_ebox_get "$name" sandbox_id)" ] || die "ebox '$name' already exists"
+
+  if ! _ebox_has_project; then
+    echo "ebox: no $EBOX_TOML_NAME — running init first" >&2
+    cmd_init
+    _ebox_has_project || die "init did not create project config"
+  fi
+
+  # inherit timeout/port from project if set
+  local proj
+  proj="$(_ebox_project_json)"
+  port="$(jq -r --argjson p "$port" '.app_port // $p' <<<"$proj")"
+  timeout="$(jq -r --argjson t "$timeout" '.timeout // $t' <<<"$proj")"
+
+  local parent kind ref
+  if [ -n "$from" ]; then
+    parent="$from"
+  else
+    parent="$(_ebox_pick_parent)" || die "cancelled"
+  fi
+  kind="${parent%%|*}"
+  ref="${parent#*|}"
+  # allow base:x / box:x / seed:x from --from
+  if [[ "$parent" == *:* && "$parent" != *\|* ]]; then
+    kind="${parent%%:*}"
+    ref="${parent#*:}"
+  fi
+
+  local created
+  case "$kind" in
+    base)
+      local snap
+      snap="$(jq -r --arg b "$ref" '.bases[$b].snapshot // empty' <<<"$proj")"
+      [ -n "$snap" ] || die "unknown base '$ref'"
+      echo "› creating '$name' from base '$ref'…"
+      created="$(_ebox_api create "$name" --snapshot "$snap" --timeout "$timeout" \
+        --port "$port" --stub-web 1)"
+      ;;
+    box)
+      local sid snap
+      sid="$(_ebox_resolve_id "$ref")"
+      echo "› snapshotting leaf '$ref' → fork '$name'…"
+      snap="$(_ebox_api snapshot "$sid")"
+      created="$(_ebox_api create "$name" --snapshot "$(jq -r .snapshot_id <<<"$snap")" \
+        --timeout "$timeout" --port "$port" --stub-web 1)"
+      ;;
+    seed)
+      echo "› creating '$name' from seed '$ref' (new lineage)…"
+      created="$(_ebox_api create "$name" --template "$ref" --timeout "$timeout" \
+        --port "$port" --stub-web 1)"
+      ;;
+    *) die "bad parent kind: $kind" ;;
+  esac
+
+  _ebox_register_created "$created"
+  _ebox_print_ready "$name" "$created"
+  echo "  from $kind:$ref"
+}
+
+# ── base / default ──────────────────────────────────────────────────────────
+cmd_base() {
+  _ebox_ensure
+  _ebox_has_project || die "no $EBOX_TOML_NAME — run: ebox"
+  local toml box_name as_name="" make_default=0
+  toml="$(_ebox_toml_path)"
+  box_name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) as_name="$2"; shift 2 ;;
+      --default) make_default=1; shift ;;
+      -*) die "usage: ebox base [box] [--as base-name] [--default]" ;;
+      *)
+        [ -z "$box_name" ] || die "usage: ebox base [box] [--as base-name] [--default]"
+        box_name="$1"
+        shift
+        ;;
+    esac
+  done
+  box_name="${box_name:-$(_ebox_pick_box)}" || exit 1
+  if [ -z "$as_name" ]; then
+    if [ -t 0 ]; then
+      read -r -p "  save as base name [$box_name]: " as_name || true
+    fi
+    as_name="${as_name:-$box_name}"
+  fi
+  [[ "$as_name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "bad base name: $as_name"
+
+  local sid snap extra=()
+  sid="$(_ebox_resolve_id "$box_name")"
+  echo "› blessing '$box_name' → base '$as_name'…"
+  snap="$(_ebox_api snapshot "$sid" --name "$as_name")"
+  (( make_default )) && extra+=(--default)
+  _ebox_api project set-base "$toml" "$as_name" "$(jq -r .snapshot_id <<<"$snap")" \
+    --source-box "$box_name" "${extra[@]}" >/dev/null
+  echo "✓ base '$as_name' ← snapshot $(jq -r .snapshot_id <<<"$snap")"
+  if (( make_default )); then
+    echo "  default_base set to '$as_name'"
+  else
+    echo "  (default unchanged — pass --default to flip)"
+  fi
+  echo "  ebox new <leaf>  # pick this base in the parent fzf"
+}
+
+cmd_default() {
+  _ebox_ensure
+  _ebox_has_project || die "no $EBOX_TOML_NAME"
+  local toml name="${1:-}"
+  toml="$(_ebox_toml_path)"
+  if [ -z "$name" ]; then
+    local proj rows b
+    proj="$(_ebox_project_json)"
+    rows=""
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      rows+="$(printf '%s\t%s' "$b" "$b")"$'\n'
+    done < <(jq -r '.bases|keys[]' <<<"$proj")
+    [ -n "$rows" ] || die "no bases yet — ebox base <box>"
+    name="$(EBOX_FZF_HEADER='BASE' _ebox_fzf 'default> ' <<<"$rows")" || exit 1
+  fi
+  _ebox_api project set-default "$toml" "$name" >/dev/null
+  echo "✓ default_base = $name"
+}
+
+# ── proxy / lifecycle (unchanged spirit) ────────────────────────────────────
+cmd_proxy() {
+  _ebox_ensure
+  need caddy
+  local name sid port host upstream routes="" hosts_block caddy_block tmp
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    sid="$(_ebox_get "$name" sandbox_id)"
+    [ -n "$sid" ] || continue
+    port="$(_ebox_get "$name" app_port)"
+    port="${port:-$EBOX_APP_PORT}"
+    host="$(_ebox_friendly_host "$name")"
+    upstream="$(_ebox_upstream "$sid" "$port")"
+    routes+="${host}"$'\t'"${upstream}"$'\n'
+    if _ebox_is_desktop "$name"; then
+      routes+="$(_ebox_vnc_friendly_host "$name")"$'\t'"$(_ebox_vnc_upstream "$sid")"$'\n'
+    fi
+  done < <(_ebox_names)
+
+  hosts_block="$(printf '%s' "$routes" | awk -F'\t' 'NF{print "127.0.0.1 "$1}' | sort -u)"
+  caddy_block="$(printf '%s' "$routes" | awk -F'\t' 'NF{
+    host=$1; up=$2; uh=up; sub(/^https?:\/\//,"",uh);
+    printf "%s {\n\ttls internal\n\treverse_proxy %s {\n\t\theader_up Host %s\n\t}\n}\n", host, up, uh
+  }')"
+
+  tmp="$(mktemp)"
+  awk '/^# BEGIN ebox-proxy/{f=1} !f{print} /^# END ebox-proxy/{f=0}' /etc/hosts >"$tmp"
+  {
+    echo "# BEGIN ebox-proxy (managed by ebox proxy)"
+    printf '%s\n' "$hosts_block"
+    echo "# END ebox-proxy"
+  } >>"$tmp"
+  sudo cp "$tmp" /etc/hosts && trash -f "$tmp"
+
+  if [ -z "$caddy_block" ]; then
+    printf '# ebox routes — none\n' | sudo tee "$EBOX_CADDY_ROUTES" >/dev/null
+  else
+    printf '%s' "$caddy_block" | sudo tee "$EBOX_CADDY_ROUTES" >/dev/null
+  fi
+  sudo systemctl reload caddy
+
+  echo "Routes:"
+  if [ -z "$routes" ]; then
+    echo "  (none)"
+  else
+    printf '%s' "$routes" | awk -F'\t' 'NF{printf "  https://%s -> %s\n", $1, $2}'
+  fi
+}
+
+cmd_ls() {
+  _ebox_ensure
+  local name sid port state url up live proj
+  live="$(_ebox_live_json)"
+  printf 'NAME\tSTATE\tURL\tUPSTREAM\n'
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    sid="$(_ebox_get "$name" sandbox_id)"
+    port="$(_ebox_get "$name" app_port)"
+    port="${port:-$EBOX_APP_PORT}"
+    state="$(_ebox_state_for "$sid" "$live")"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$state" "$(_ebox_friendly_url "$name")" \
+      "$(_ebox_upstream "$sid" "$port")"
+  done < <(_ebox_names) | column -t -s $'\t'
+
+  if _ebox_has_project; then
+    proj="$(_ebox_project_json)"
+    echo
+    echo "Bases ($(_ebox_toml_path)):"
+    if [ "$(jq '.bases|length' <<<"$proj")" = "0" ]; then
+      echo "  (none — ebox base <box>)"
+    else
+      jq -r --arg d "$(jq -r '.default_base // empty' <<<"$proj")" '
+        .bases|to_entries[] |
+        "  \(if .key==$d then "*" else " " end) \(.key)  \(.value.snapshot[0:40])…  src=\(.value.source_box // "-")"
+      ' <<<"$proj"
+    fi
+  else
+    echo
+    echo "  no $EBOX_TOML_NAME — run: ebox"
+  fi
+}
+
+cmd_console() {
+  _ebox_ensure
+  local name sid
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  sid="$(_ebox_resolve_id "$name")"
+  echo "› ebox $name ($sid)"
+  exec e2b sbx connect "$sid"
+}
+
+cmd_url() {
+  _ebox_ensure
+  local name
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  if [ "${2:-}" = "--upstream" ]; then
+    local sid port
+    sid="$(_ebox_resolve_id "$name")"
+    port="$(_ebox_get "$name" app_port)"
+    port="${port:-$EBOX_APP_PORT}"
+    _ebox_upstream "$sid" "$port"
+    echo
+    return 0
+  fi
+  _ebox_friendly_url "$name"
+  echo
+}
+
+cmd_open() {
+  local name url
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  url="$(_ebox_friendly_url "$name")"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 &
+  else
+    echo "$url"
+  fi
+}
+
+cmd_pause() {
+  _ebox_ensure
+  local name sid
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  sid="$(_ebox_resolve_id "$name")"
+  e2b sbx pause "$sid"
+  echo "✓ paused $name"
+}
+
+cmd_wake() {
+  _ebox_ensure
+  local name sid port
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  sid="$(_ebox_resolve_id "$name")"
+  port="$(_ebox_get "$name" app_port)"
+  port="${port:-$EBOX_APP_PORT}"
+  _ebox_api ensure_web "$sid" "$port" >/dev/null
+  echo "✓ awake $name  $(_ebox_friendly_url "$name")"
+}
+
+cmd_id() {
+  _ebox_ensure
+  local name
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  _ebox_resolve_id "$name"
+  echo
+}
+
+cmd_rm() {
+  _ebox_ensure
+  local name sid
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  sid="$(_ebox_resolve_id "$name")"
+  echo "› killing '$name' ($sid) forever…"
+  e2b sbx kill "$sid" 2>/dev/null || true
+  _ebox_del "$name"
+  cmd_proxy >/dev/null 2>&1 || true
+  echo "✓ destroyed $name — not recoverable"
+}
+
+cmd_go() {
+  _ebox_ensure
+  if ! _ebox_has_project; then
+    cmd_init
+    return
+  fi
+  if [ -z "$(_ebox_names)" ]; then
+    echo "ebox: project configured but no boxes — try: ebox new <name>"
+    return 0
+  fi
+  cmd_console "${1:-}"
+}
+
+cmd_trust() {
+  # Chrome/Chromium on Linux use NSS (~/.pki/nssdb), not only the system store.
+  # Caddy's `caddy trust` often only hits the system store → Chrome still screams.
+  _ebox_ensure
+  need certutil
+  local ca_src="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+  local ca_tmp
+  ca_tmp="$(mktemp --suffix=.crt)"
+  sudo test -r "$ca_src" || die "Caddy local CA not found at $ca_src (is caddy installed?)"
+  sudo cp "$ca_src" "$ca_tmp"
+  sudo chmod 644 "$ca_tmp"
+  mkdir -p "$HOME/.pki/nssdb"
+  if [ ! -f "$HOME/.pki/nssdb/cert9.db" ]; then
+    certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password
+  fi
+  certutil -d sql:"$HOME/.pki/nssdb" -D -n "Caddy Local Authority" 2>/dev/null || true
+  certutil -d sql:"$HOME/.pki/nssdb" -A -t "C,," -n "Caddy Local Authority" -i "$ca_tmp"
+  trash -f "$ca_tmp" 2>/dev/null || rm -f "$ca_tmp"
+  # Best-effort system store too
+  sudo caddy trust 2>/dev/null || true
+  echo "✓ Caddy local CA installed into NSS ($HOME/.pki/nssdb)"
+  echo "  Fully quit Chrome/Chromium (all windows) and reopen, then try https://<box>.<repo>.test"
+}
+
+cmd_help() {
+  cat <<EOF
+ebox — E2B multi-base boxes (chad-style carbon copies)
+
+  ebox                     no .ebox.toml → init wizard; else fzf → console
+  ebox new <name>          fzf parent (bases | boxes | seeds) → create
+  ebox base [box] [--as B] [--default]  bless box as named project base
+  ebox default [base]      set default_base highlight
+  ebox ls | list
+  ebox console | go [name]
+  ebox url | open | proxy | pause | wake | id
+  ebox trust               install Caddy CA into Chrome NSS trust store
+  ebox rm [name]           kill forever
+  ebox help
+
+.parent fzf on \`ebox new\`:
+  bases     blessed snapshots from .ebox.toml
+  boxes     live/paused leaves (fork like wt-from-leaf)
+  seeds     public (base, desktop) + your private E2B templates
+
+Lifecycle: idle ${EBOX_TIMEOUT}s → pause (free, forever). rm = permanent.
+DNS: https://<box>.<repo>.test  (repo = main git folder via git-common-dir,
+     not the worktree leaf name). Override: EBOX_DNS_ZONE=foo.test
+     Stored per box at create; \`ebox proxy\` wires Caddy/hosts.
+     If Chrome says the site is unsafe: \`ebox trust\` then restart Chrome.
+Config: $EBOX_TOML_NAME at git root · registry: $EBOX_REGISTRY
+EOF
+}
+
+main() {
+  local arg="${1:-go}"
+  case "$arg" in
+    go) shift || true; cmd_go "${1:-}" ;;
+    init) cmd_init ;;
+    new) shift; cmd_new "$@" ;;
+    base) shift; cmd_base "$@" ;;
+    default) shift; cmd_default "$@" ;;
+    ls|list) cmd_ls ;;
+    console|c|ssh) shift; cmd_console "$@" ;;
+    url) shift; cmd_url "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    proxy) cmd_proxy ;;
+    trust) cmd_trust ;;
+    pause|ps) shift; cmd_pause "$@" ;;
+    wake|resume|rs) shift; cmd_wake "$@" ;;
+    id) shift; cmd_id "$@" ;;
+    rm|remove|kill|destroy) shift; cmd_rm "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      if ! _ebox_has_project 2>/dev/null; then
+        cmd_init
+      else
+        cmd_console "$arg"
+      fi
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
