@@ -14,7 +14,7 @@ set -euo pipefail
 EBOX_DIR="${EBOX_DIR:-$HOME/.config/ebox}"
 EBOX_REGISTRY="${EBOX_REGISTRY:-$EBOX_DIR/registry.json}"
 EBOX_PY="${EBOX_PY:-$HOME/.local/share/ebox/venv/bin/python}"
-EBOX_API="${EBOX_API:-$HOME/.local/share/ebox/ebox_api.py}"
+EBOX_API="${EBOX_API:-$HOME/.local/scripts/ebox_api.py}"
 EBOX_TIMEOUT="${EBOX_TIMEOUT:-600}"
 EBOX_APP_PORT="${EBOX_APP_PORT:-8080}"
 # Optional override (e.g. export EBOX_DNS_ZONE=foo.test). Default: <main-repo>.test
@@ -197,6 +197,20 @@ _ebox_vnc_friendly_host() {
 _ebox_vnc_upstream() {
   local sid="$1"
   _ebox_upstream "$sid" "$EBOX_VNC_PORT"
+}
+
+_ebox_ensure_desktop() {
+  local name="$1" sid info
+  _ebox_is_desktop "$name" || return 0
+  sid="$(_ebox_get "$name" sandbox_id)"
+  [ -n "$sid" ] || return 0
+  echo "› ensuring desktop/VNC on '$name'…"
+  info="$(_ebox_api ensure_desktop "$sid")"
+  if [ "$(jq -r '.running // false' <<<"$info")" != "true" ]; then
+    echo "ebox: warning: desktop/VNC did not come up on '$name'" >&2
+    return 1
+  fi
+  return 0
 }
 
 # Friendly noVNC URL when desktop; empty otherwise.
@@ -669,13 +683,16 @@ cmd_pause() {
 
 cmd_wake() {
   _ebox_ensure
-  local name sid port
+  local name sid port vnc
   name="$(_ebox_pick_box "${1:-}")" || exit 1
   sid="$(_ebox_resolve_id "$name")"
   port="$(_ebox_get "$name" app_port)"
   port="${port:-$EBOX_APP_PORT}"
   _ebox_api ensure_web "$sid" "$port" >/dev/null
+  _ebox_ensure_desktop "$name" || true
   echo "✓ awake $name  $(_ebox_friendly_url "$name")"
+  vnc="$(_ebox_vnc_url "$name")"
+  [ -n "$vnc" ] && echo "  VNC  $vnc"
 }
 
 cmd_id() {
@@ -759,6 +776,7 @@ Lifecycle: idle ${EBOX_TIMEOUT}s → pause (free, forever). rm = permanent.
 DNS: https://<box>.<repo>.test  (repo = main git folder via git-common-dir,
      not the worktree leaf name). Override: EBOX_DNS_ZONE=foo.test
      Stored per box at create; \`ebox proxy\` wires Caddy/hosts.
+     Desktop boxes also get https://<box>-vnc.<repo>.test (auto-started on create/wake).
      If Chrome says the site is unsafe: \`ebox trust\` then restart Chrome.
 Config: $EBOX_TOML_NAME at git root · registry: $EBOX_REGISTRY
 EOF
