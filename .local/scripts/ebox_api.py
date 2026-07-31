@@ -82,10 +82,11 @@ def _port_open(sbx, port: int) -> bool:
         return False
 
 
-def _proc_running(sbx, pattern: str) -> bool:
+def _proc_running(sbx, name: str) -> bool:
+    """Exact process-name match (avoids shell-quoting pitfalls of pgrep -f)."""
     try:
         r = sbx.commands.run(
-            f"bash -lc 'pgrep -f {pattern!r} >/dev/null'",
+            f"bash -lc 'pgrep -x {name} >/dev/null'",
             timeout=10,
         )
         return r.exit_code == 0
@@ -99,6 +100,43 @@ def _wait_port(sbx, port: int, attempts: int = 40, delay: float = 0.25) -> bool:
             return True
         time.sleep(delay)
     return False
+
+
+def _desktop_healthy(sbx, *, vnc_port: int = 5900, novnc_port: int = 6080) -> bool:
+    """Require the full stack — HTML on 6080 alone is a bear trap."""
+    return (
+        _proc_running(sbx, "Xvfb")
+        and _proc_running(sbx, "x11vnc")
+        and _port_open(sbx, vnc_port)
+        and _port_open(sbx, novnc_port)
+    )
+
+
+def _kill_stale_desktop(sbx) -> None:
+    # Best-effort cleanup of half-dead stacks (e.g. noVNC up, Xvfb/x11vnc gone).
+    script = r"""
+set +e
+for p in novnc_proxy websockify x11vnc startxfce4 xfce4-session Xvfb; do
+  pkill -x "$p" >/dev/null 2>&1
+done
+pkill -f 'novnc_proxy|websockify/run|/opt/noVNC' >/dev/null 2>&1
+# websockify often shows up as python3 — free the ports directly
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k 5900/tcp 6080/tcp >/dev/null 2>&1
+fi
+# last resort
+for port in 5900 6080; do
+  pids=$(ss -lptn "sport = :$port" 2>/dev/null | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)
+  for pid in $pids; do kill -9 "$pid" >/dev/null 2>&1; done
+done
+sleep 0.5
+"""
+    try:
+        sbx.files.write("/tmp/ebox-kill-desktop.sh", script)
+        sbx.commands.run("bash /tmp/ebox-kill-desktop.sh", timeout=20)
+    except Exception:
+        pass
+    time.sleep(0.3)
 
 
 def _ensure_desktop(
@@ -115,7 +153,7 @@ def _ensure_desktop(
     if not _desktop_tools_present(sbx):
         return {"desktop": False, "running": False, "reason": "not_desktop"}
 
-    if _port_open(sbx, novnc_port):
+    if _desktop_healthy(sbx, vnc_port=vnc_port, novnc_port=novnc_port):
         return {
             "desktop": True,
             "running": True,
@@ -124,61 +162,66 @@ def _ensure_desktop(
             "upstream": f"https://{sbx.get_host(novnc_port)}",
         }
 
+    # Half-open stacks (common after pause/resume or partial kill) must be reset.
+    _kill_stale_desktop(sbx)
+
     # Xvfb
-    if not _proc_running(sbx, "Xvfb"):
-        sbx.commands.run(
-            f"bash -lc 'Xvfb {display} -ac -screen 0 {width}x{height}x24 -retro -dpi {dpi} "
-            f"-nolisten tcp -nolisten unix >/tmp/xvfb.log 2>&1'",
-            background=True,
-            timeout=0,
-        )
-        # wait for display
-        ok = False
-        for _ in range(40):
-            try:
-                r = sbx.commands.run(
-                    f"bash -lc 'xdpyinfo -display {display} >/dev/null'",
-                    timeout=10,
-                )
-                if r.exit_code == 0:
-                    ok = True
-                    break
-            except Exception:
-                pass
-            time.sleep(0.25)
-        if not ok:
-            raise SystemExit("ebox-api ensure_desktop: Xvfb failed to start")
+    sbx.commands.run(
+        f"bash -lc 'Xvfb {display} -ac -screen 0 {width}x{height}x24 -retro -dpi {dpi} "
+        f"-nolisten tcp -nolisten unix >/tmp/xvfb.log 2>&1'",
+        background=True,
+        timeout=0,
+    )
+    ok = False
+    for _ in range(40):
+        try:
+            r = sbx.commands.run(
+                f"bash -lc 'xdpyinfo -display {display} >/dev/null'",
+                timeout=10,
+            )
+            if r.exit_code == 0:
+                ok = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.25)
+    if not ok:
+        raise SystemExit("ebox-api ensure_desktop: Xvfb failed to start")
 
     # XFCE
-    if not _proc_running(sbx, "xfce4-session"):
-        sbx.commands.run(
-            f"bash -lc 'export DISPLAY={display} HOME=/home/user; "
-            f"eval \"$(dbus-launch --sh-syntax)\"; "
-            f"export DBUS_SESSION_BUS_ADDRESS; "
-            f"startxfce4 >/tmp/xfce4.log 2>&1'",
-            background=True,
-            timeout=0,
-        )
-        time.sleep(1.5)
+    sbx.commands.run(
+        f"bash -lc 'export DISPLAY={display} HOME=/home/user; "
+        f"eval \"$(dbus-launch --sh-syntax)\"; "
+        f"startxfce4 >/tmp/xfce4.log 2>&1'",
+        background=True,
+        timeout=0,
+    )
+    time.sleep(1.5)
 
-    # x11vnc
-    if not _proc_running(sbx, "x11vnc"):
+    # x11vnc ( -bg parent can exit non-zero; judge by listening port)
+    try:
         sbx.commands.run(
             f"bash -lc 'x11vnc -bg -display {display} -forever -wait 50 -shared "
-            f"-rfbport {vnc_port} -nopw >/tmp/x11vnc.log 2>&1'",
+            f"-rfbport {vnc_port} -nopw >/tmp/x11vnc.log 2>&1 || true'",
             timeout=20,
         )
+    except Exception:
+        pass
+    if not _wait_port(sbx, vnc_port):
+        raise SystemExit("ebox-api ensure_desktop: x11vnc port did not open")
 
     # noVNC
-    if not _port_open(sbx, novnc_port):
-        sbx.commands.run(
-            f"bash -lc 'cd /opt/noVNC/utils && ./novnc_proxy --vnc localhost:{vnc_port} "
-            f"--listen {novnc_port} --web /opt/noVNC >/tmp/novnc.log 2>&1'",
-            background=True,
-            timeout=0,
-        )
-        if not _wait_port(sbx, novnc_port):
-            raise SystemExit("ebox-api ensure_desktop: noVNC port did not open")
+    sbx.commands.run(
+        f"bash -lc 'cd /opt/noVNC/utils && ./novnc_proxy --vnc localhost:{vnc_port} "
+        f"--listen {novnc_port} --web /opt/noVNC >/tmp/novnc.log 2>&1'",
+        background=True,
+        timeout=0,
+    )
+    if not _wait_port(sbx, novnc_port):
+        raise SystemExit("ebox-api ensure_desktop: noVNC port did not open")
+
+    if not _desktop_healthy(sbx, vnc_port=vnc_port, novnc_port=novnc_port):
+        raise SystemExit("ebox-api ensure_desktop: desktop stack unhealthy after start")
 
     return {
         "desktop": True,
