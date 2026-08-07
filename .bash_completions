@@ -76,6 +76,65 @@ _wt_completion() {
 complete -F _wt_completion wt
 
 # ----------------------------------------------------------------------------
+# ebox — E2B multi-base boxes. Jump/console default when configured; init otherwise.
+# ----------------------------------------------------------------------------
+_ebox_completion_names() {
+    local reg="${EBOX_REGISTRY:-$HOME/.config/ebox/registry.json}"
+    [ -r "$reg" ] || return 0
+    jq -r 'keys[]' "$reg" 2>/dev/null
+}
+
+_ebox_completion_bases() {
+    local root toml
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    toml="$root/${EBOX_TOML_NAME:-.ebox.toml}"
+    [ -r "$toml" ] || return 0
+    # rough TOML: lines under [bases.NAME]
+    awk -F'[][]' '/^\[bases\./{gsub(/^bases\./,"",$2); print $2}' "$toml" 2>/dev/null
+}
+
+_ebox_completion() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local subcmds="go init new base default list ls rm remove kill destroy console c ssh url open proxy trust pause wake resume id help -h --help"
+    local names bases
+    names="$(_ebox_completion_names)"
+    bases="$(_ebox_completion_bases)"
+
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$subcmds $names" -- "$cur") )
+        return 0
+    fi
+
+    local prev="${COMP_WORDS[1]}"
+    case "$prev" in
+        new)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--from --timeout --port" -- "$cur") )
+            fi
+            ;;
+        base)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--as" -- "$cur") )
+            else
+                local pprev="${COMP_WORDS[COMP_CWORD-1]}"
+                if [ "$pprev" = "--as" ]; then
+                    COMPREPLY=( $(compgen -W "$bases" -- "$cur") )
+                else
+                    COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+                fi
+            fi
+            ;;
+        default)
+            COMPREPLY=( $(compgen -W "$bases" -- "$cur") )
+            ;;
+        go|rm|remove|kill|destroy|console|c|ssh|url|open|pause|wake|resume|id)
+            COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _ebox_completion ebox
+
+# ----------------------------------------------------------------------------
 # mcporter — MCP CLI & generator (bun global). Completes subcommands,
 # `config` subcommands, and server names. Server names are parsed offline from
 # the MCP config JSONs (~instant); `mcporter list` pings every server (~2.6s),

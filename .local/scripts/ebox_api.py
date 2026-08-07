@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -238,7 +239,7 @@ def cmd_ensure_desktop(args: list[str]) -> None:
         raise SystemExit("ebox-api ensure_desktop: sandbox_id required")
     sid = args[0]
     Sandbox = _Sandbox()
-    sbx = Sandbox.connect(sid, timeout=600)
+    sbx = Sandbox.connect(sid, timeout=60)
     print(json.dumps(_ensure_desktop(sbx)))
 
 def cmd_create(args: list[str]) -> None:
@@ -248,7 +249,7 @@ def cmd_create(args: list[str]) -> None:
     name = args[0]
     template = None
     snapshot = None
-    timeout = 600
+    timeout = 60
     port = 8080
     stub_web = True
     i = 1
@@ -350,7 +351,7 @@ def cmd_snapshot(args: list[str]) -> None:
             raise SystemExit(f"ebox-api snapshot: unknown arg {args[i]}")
 
     Sandbox = _Sandbox()
-    sbx = Sandbox.connect(sid, timeout=600)
+    sbx = Sandbox.connect(sid, timeout=60)
     info = sbx.create_snapshot(name=label) if label else sbx.create_snapshot()
     print(
         json.dumps(
@@ -367,7 +368,7 @@ def cmd_url(args: list[str]) -> None:
     sid = args[0]
     port = int(args[1]) if len(args) > 1 else 8080
     Sandbox = _Sandbox()
-    sbx = Sandbox.connect(sid, timeout=600)
+    sbx = Sandbox.connect(sid, timeout=60)
     print(f"https://{sbx.get_host(port)}")
 
 
@@ -375,7 +376,7 @@ def cmd_ensure_web(args: list[str]) -> None:
     sid = args[0]
     port = int(args[1]) if len(args) > 1 else 8080
     Sandbox = _Sandbox()
-    sbx = Sandbox.connect(sid, timeout=600)
+    sbx = Sandbox.connect(sid, timeout=60)
     sbx.commands.run(
         f"bash -lc 'ss -lntp 2>/dev/null | grep -q :{port} || "
         f"(mkdir -p /home/user/ebox-www && "
@@ -418,7 +419,7 @@ def cmd_list_templates(_args: list[str]) -> None:
 
 def _read_project(path: Path) -> dict:
     if not path.is_file():
-        return {"default_base": None, "app_port": 8080, "timeout": 600, "bases": {}}
+        return {"default_base": None, "app_port": 8080, "timeout": 60, "bases": {}}
     try:
         import tomllib
     except ImportError:
@@ -433,7 +434,7 @@ def _read_project(path: Path) -> dict:
     return {
         "default_base": data.get("default_base"),
         "app_port": int(data.get("app_port") or 8080),
-        "timeout": int(data.get("timeout") or 600),
+        "timeout": int(data.get("timeout") or 60),
         "bases": norm,
     }
 
@@ -448,7 +449,7 @@ def _write_project(path: Path, data: dict) -> None:
     if db:
         lines.append(f'default_base = "{db}"')
     lines.append(f"app_port = {int(data.get('app_port') or 8080)}")
-    lines.append(f"timeout = {int(data.get('timeout') or 600)}")
+    lines.append(f"timeout = {int(data.get('timeout') or 60)}")
     lines.append("")
     for name in sorted((data.get("bases") or {}).keys()):
         b = data["bases"][name]
@@ -479,7 +480,7 @@ def cmd_project(args: list[str]) -> None:
             raise SystemExit(f"ebox-api project init: already exists: {path}")
         _write_project(
             path,
-            {"default_base": None, "app_port": 8080, "timeout": 600, "bases": {}},
+            {"default_base": None, "app_port": 8080, "timeout": 60, "bases": {}},
         )
         print(json.dumps({"path": str(path)}))
     elif sub == "set-base":
@@ -534,10 +535,291 @@ def cmd_project(args: list[str]) -> None:
         raise SystemExit(f"ebox-api project: unknown sub {sub}")
 
 
+
+def _activity_probe_script(idle_threshold_ms: int) -> str:
+    # Runs inside the sandbox. Uses XScreenSaver idle (same as xprintidle)
+    # + established VNC/noVNC sockets. Connection alone is NOT activity —
+    # a forgotten browser tab keeps the websocket up while idle_ms grows.
+    return f"""
+import ctypes, ctypes.util, json, os, subprocess
+os.environ.setdefault("DISPLAY", ":0")
+idle_ms = None
+err = None
+try:
+    X11 = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11"))
+    Xss = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xss") or "libXss.so.1")
+    class Info(ctypes.Structure):
+        _fields_ = [
+            ("window", ctypes.c_ulong),
+            ("state", ctypes.c_int),
+            ("kind", ctypes.c_int),
+            ("til_or_since", ctypes.c_ulong),
+            ("idle", ctypes.c_ulong),
+            ("eventMask", ctypes.c_ulong),
+        ]
+    X11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    X11.XOpenDisplay.restype = ctypes.c_void_p
+    X11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    X11.XDefaultRootWindow.restype = ctypes.c_ulong
+    Xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(Info)
+    Xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(Info)]
+    Xss.XScreenSaverQueryInfo.restype = ctypes.c_int
+    dpy = X11.XOpenDisplay(None)
+    if not dpy:
+        raise RuntimeError("XOpenDisplay failed")
+    info = Xss.XScreenSaverAllocInfo()
+    rc = Xss.XScreenSaverQueryInfo(dpy, X11.XDefaultRootWindow(dpy), info)
+    if not rc:
+        raise RuntimeError("XScreenSaverQueryInfo failed")
+    idle_ms = int(info.contents.idle)
+except Exception as e:
+    err = str(e)
+try:
+    out = subprocess.check_output(
+        ["bash", "-lc", "ss -H -tn state established '( sport = :6080 or sport = :5900 )' | wc -l"],
+        text=True,
+    )
+    vnc_clients = int(out.strip() or 0)
+except Exception:
+    vnc_clients = 0
+threshold = {idle_threshold_ms}
+vnc_connected = vnc_clients > 0
+vnc_active = bool(vnc_connected and idle_ms is not None and idle_ms < threshold)
+print(json.dumps({{
+    "vnc_clients": vnc_clients,
+    "vnc_connected": vnc_connected,
+    "idle_ms": idle_ms,
+    "idle_threshold_ms": threshold,
+    "vnc_active": vnc_active,
+    "error": err,
+}}))
+"""
+
+
+def cmd_set_timeout(args: list[str]) -> None:
+    """set_timeout <sandbox_id> <seconds> — reset TTL from now (keepalive beat)."""
+    if len(args) < 2:
+        raise SystemExit("ebox-api set_timeout: sandbox_id seconds required")
+    sid = args[0]
+    timeout = int(args[1])
+    Sandbox = _Sandbox()
+    _load_api_key()
+    Sandbox.set_timeout(sid, timeout)
+    print(json.dumps({"sandbox_id": sid, "timeout": timeout}))
+
+
+def cmd_activity(args: list[str]) -> None:
+    """activity <sandbox_id> [--idle-secs N]
+
+    Hybrid VNC signal:
+      connected sockets on :6080/:5900  AND  X11 idle < threshold
+    Forgotten tabs stay connected but idle_ms grows → vnc_active=false.
+    """
+    if not args:
+        raise SystemExit("ebox-api activity: sandbox_id required")
+    sid = args[0]
+    idle_secs = 300
+    i = 1
+    while i < len(args):
+        if args[i] == "--idle-secs" and i + 1 < len(args):
+            idle_secs = int(args[i + 1])
+            i += 2
+        else:
+            raise SystemExit(f"ebox-api activity: unknown arg {args[i]}")
+    import base64
+
+    Sandbox = _Sandbox()
+    sbx = Sandbox.connect(sid, timeout=60)
+    script = _activity_probe_script(idle_secs * 1000)
+    # Avoid /tmp permission races — feed the probe over stdin.
+    b64 = base64.b64encode(script.encode()).decode()
+    r = sbx.commands.run(
+        f"echo {b64} | base64 -d | DISPLAY=:0 python3 -",
+        timeout=20,
+    )
+    out = (r.stdout or "").strip()
+    if r.exit_code != 0 or not out:
+        raise SystemExit(
+            f"ebox-api activity: probe failed code={r.exit_code} stderr={r.stderr!r} stdout={r.stdout!r}"
+        )
+    data = json.loads(out.splitlines()[-1])
+    print(json.dumps(data))
+
+
+
+def cmd_console_session(args: list[str]) -> None:
+    """console_session <sandbox_id> [--timeout SECS] [--idle-secs N] [--interval SECS]
+
+    Run `e2b sbx connect` under a local PTY and beat set_timeout ONLY when the
+    PTY recently saw stdin OR stdout/stderr bytes.
+
+    Why not "attached = active":
+      - Coffee at an idle prompt should sleep the box.
+      - A quiet agent mid-turn still produces periodic output; idle window
+        (default 300s) covers thinking gaps without needing agent APIs.
+      - Classic bash TMOUT is stdin-only — wrong for agents. We use either direction.
+    """
+    import errno
+    import fcntl
+    import pty
+    import select
+    import signal
+    import struct
+    import termios
+    import threading
+    import tty
+
+    if not args:
+        raise SystemExit("ebox-api console_session: sandbox_id required")
+    sid = args[0]
+    timeout = 60
+    idle_secs = 300
+    interval = 200
+    i = 1
+    while i < len(args):
+        if args[i] == "--timeout" and i + 1 < len(args):
+            timeout = int(args[i + 1]); i += 2
+        elif args[i] == "--idle-secs" and i + 1 < len(args):
+            idle_secs = int(args[i + 1]); i += 2
+        elif args[i] == "--interval" and i + 1 < len(args):
+            interval = int(args[i + 1]); i += 2
+        else:
+            raise SystemExit(f"ebox-api console_session: unknown arg {args[i]}")
+
+    if not sys.stdin.isatty():
+        # Non-interactive fallback: plain connect, no keepalive.
+        raise SystemExit(subprocess.call(["e2b", "sbx", "connect", sid]))
+
+    Sandbox = _Sandbox()
+    _load_api_key()
+
+    last_io = time.monotonic()
+    stop = threading.Event()
+    child_pid = None
+
+    def note_io() -> None:
+        nonlocal last_io
+        last_io = time.monotonic()
+
+    def keepalive() -> None:
+        # Beat only while recent PTY traffic exists. Silent gaps < idle_secs are OK.
+        while not stop.wait(interval):
+            age = time.monotonic() - last_io
+            if age <= idle_secs:
+                try:
+                    Sandbox.set_timeout(sid, timeout)
+                except Exception:
+                    # Sandbox may already be gone/paused — keep looping until PTY exits.
+                    pass
+
+    def _set_winsize(fd: int) -> None:
+        try:
+            cols, rows = shutil.get_terminal_size(fallback=(80, 24))
+            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
+        except Exception:
+            pass
+
+    def _on_winch(_signum, _frame) -> None:
+        if master_fd is not None:
+            _set_winsize(master_fd)
+            if child_pid:
+                try:
+                    os.kill(child_pid, signal.SIGWINCH)
+                except ProcessLookupError:
+                    pass
+
+    master_fd = None
+    stdin_fd = sys.stdin.fileno()
+    old = termios.tcgetattr(stdin_fd)
+    try:
+        master_fd, slave_fd = pty.openpty()
+        _set_winsize(master_fd)
+        note_io()  # connecting counts as activity kickoff
+        child_pid = os.fork()
+        if child_pid == 0:
+            # Child: become the session leader on the slave PTY.
+            try:
+                os.setsid()
+            except OSError:
+                pass
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+            os.close(master_fd)
+            os.execvp("e2b", ["e2b", "sbx", "connect", sid])
+            os._exit(127)
+
+        os.close(slave_fd)
+        signal.signal(signal.SIGWINCH, _on_winch)
+        tty.setraw(stdin_fd)
+
+        t = threading.Thread(target=keepalive, name="ebox-console-keepalive", daemon=True)
+        t.start()
+
+        # Initial beat so a fresh connect doesn't race the first interval.
+        try:
+            Sandbox.set_timeout(sid, timeout)
+        except Exception:
+            pass
+
+        while True:
+            try:
+                r, _, _ = select.select([master_fd, stdin_fd], [], [])
+            except (InterruptedError, select.error) as e:
+                if getattr(e, "errno", None) == errno.EINTR or isinstance(e, InterruptedError):
+                    continue
+                raise
+            if master_fd in r:
+                try:
+                    data = os.read(master_fd, 8192)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                note_io()
+                os.write(1, data)
+            if stdin_fd in r:
+                try:
+                    data = os.read(stdin_fd, 8192)
+                except OSError:
+                    data = b""
+                if not data:
+                    # stdin closed — still wait for remote EOF
+                    continue
+                note_io()
+                os.write(master_fd, data)
+    finally:
+        stop.set()
+        try:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+        rc = 0
+        if child_pid:
+            try:
+                _, status = os.waitpid(child_pid, 0)
+                if os.WIFEXITED(status):
+                    rc = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    rc = 128 + os.WTERMSIG(status)
+            except ChildProcessError:
+                pass
+        raise SystemExit(rc)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(
-            "usage: ebox-api <create|snapshot|url|ensure_web|ensure_desktop|list_templates|project> ..."
+            "usage: ebox-api <create|snapshot|url|ensure_web|ensure_desktop|list_templates|project|set_timeout|activity|console_session> ..."
         )
     cmd = sys.argv[1]
     args = sys.argv[2:]
@@ -549,6 +831,9 @@ def main() -> None:
         "ensure_desktop": cmd_ensure_desktop,
         "list_templates": cmd_list_templates,
         "project": cmd_project,
+        "set_timeout": cmd_set_timeout,
+        "activity": cmd_activity,
+        "console_session": cmd_console_session,
     }
     if cmd not in dispatch:
         raise SystemExit(f"unknown command: {cmd}")

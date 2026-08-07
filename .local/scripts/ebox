@@ -7,15 +7,18 @@
 #   ebox base [box] [--as N]  bless box snapshot as named project base
 #   ebox default <base>       set default_base in .ebox.toml
 #   ebox ls / url / open / proxy / pause / wake / console / rm / id
+#   ebox activity / keep   (keep auto-starts on wake/open for desktop)
 #
 # Idle: timeout → pause (kept forever, free). ebox rm = kill forever.
+# Desktop: wake/open auto-starts hybrid VNC keepalive in background.
 set -euo pipefail
 
 EBOX_DIR="${EBOX_DIR:-$HOME/.config/ebox}"
 EBOX_REGISTRY="${EBOX_REGISTRY:-$EBOX_DIR/registry.json}"
 EBOX_PY="${EBOX_PY:-$HOME/.local/share/ebox/venv/bin/python}"
 EBOX_API="${EBOX_API:-$HOME/.local/scripts/ebox_api.py}"
-EBOX_TIMEOUT="${EBOX_TIMEOUT:-600}"
+EBOX_TIMEOUT="${EBOX_TIMEOUT:-60}"
+EBOX_KEEPALIVE_IDLE="${EBOX_KEEPALIVE_IDLE:-120}"  # console PTY I/O + VNC X11 idle threshold
 EBOX_APP_PORT="${EBOX_APP_PORT:-8080}"
 # Optional override (e.g. export EBOX_DNS_ZONE=foo.test). Default: <main-repo>.test
 # or <cwd-basename>.test when not in git. Never uses a linked worktree folder name.
@@ -275,10 +278,10 @@ _ebox_pick_box() {
     st="$(_ebox_state_for "$sid" "$live")"
     vnc="$(_ebox_vnc_url "$n")"
     [ -n "$vnc" ] || vnc="-"
-    # NOTE: $(...) strips trailing newlines — append $'\n' outside or rows glue together
+    # NOTE: $(...) strips trailing newlines — append $'\n' outside; feed with printf '%s' (not <<<) or fzf gets a blank line
     rows+="$(printf '%-16s %-8s %-28s %s	%s' "$n" "$st" "$(_ebox_friendly_url "$n")" "$vnc" "$n")"$'\n'
   done <<<"$names"
-  EBOX_FZF_HEADER='NAME  STATE  URL  VNC' _ebox_fzf 'ebox> ' <<<"$rows"
+  printf '%s' "$rows" | EBOX_FZF_HEADER='NAME  STATE  URL  VNC' _ebox_fzf 'ebox> '
 }
 
 _ebox_resolve_id() {
@@ -355,7 +358,7 @@ _ebox_pick_parent() {
   ' <<<"$tpls")
 
   [ -n "$rows" ] || die "nothing to fork from — run ebox (init) first"
-  EBOX_FZF_HEADER='KIND  NAME  DETAIL' _ebox_fzf 'parent> ' <<<"$rows"
+  printf '%s' "$rows" | EBOX_FZF_HEADER='KIND  NAME  DETAIL' _ebox_fzf 'parent> '
 }
 
 # ── init wizard ─────────────────────────────────────────────────────────────
@@ -546,7 +549,7 @@ cmd_default() {
       rows+="$(printf '%s\t%s' "$b" "$b")"$'\n'
     done < <(jq -r '.bases|keys[]' <<<"$proj")
     [ -n "$rows" ] || die "no bases yet — ebox base <box>"
-    name="$(EBOX_FZF_HEADER='BASE' _ebox_fzf 'default> ' <<<"$rows")" || exit 1
+    name="$(printf '%s' "$rows" | EBOX_FZF_HEADER='BASE' _ebox_fzf 'default> ')" || exit 1
   fi
   _ebox_api project set-default "$toml" "$name" >/dev/null
   echo "✓ default_base = $name"
@@ -635,13 +638,191 @@ cmd_ls() {
   fi
 }
 
-cmd_console() {
+
+# Keepalive: E2B TTL is a hard countdown — VNC/console traffic does NOT extend it.
+# Something on the HOST must call set_timeout (API key lives here).
+# Console ⇒ beat set_timeout only on recent PTY stdin/stdout (not mere attach).
+# Desktop/VNC ⇒ auto background keeper on wake/open (hybrid activity):
+#   connected :6080/:5900 AND X11 idle < EBOX_KEEPALIVE_IDLE
+# Explicit `ebox keep` is optional foreground debug / status — not required day-to-day.
+EBOX_KEEP_DIR="${EBOX_KEEP_DIR:-$EBOX_DIR/keep}"
+
+_ebox_keepalive_interval() {
+  # Must stay well under TTL so we beat before endAt. Floor 15s.
+  local t="${1:-$EBOX_TIMEOUT}"
+  local i=$(( t / 3 ))
+  if [ "$i" -lt 15 ]; then i=15; fi
+  if [ "$i" -gt 300 ]; then i=300; fi
+  # never >= TTL (would race the hard deadline)
+  if [ "$i" -ge "$t" ] && [ "$t" -gt 15 ]; then i=$(( t / 2 )); fi
+  if [ "$i" -lt 15 ]; then i=15; fi
+  printf '%s' "$i"
+}
+
+_ebox_project_timeout() {
+  local t="$EBOX_TIMEOUT"
+  if _ebox_has_project 2>/dev/null; then
+    local proj
+    proj="$(_ebox_api project get "$(_ebox_toml_path)" 2>/dev/null)" || proj=""
+    if [ -n "$proj" ]; then
+      t="$(jq -r --argjson t "$t" '.timeout // $t' <<<"$proj")"
+    fi
+  fi
+  printf '%s' "$t"
+}
+
+_ebox_keep_pidfile() { printf '%s/%s.pid' "$EBOX_KEEP_DIR" "$1"; }
+_ebox_keep_logfile() { printf '%s/%s.log' "$EBOX_KEEP_DIR" "$1"; }
+
+_ebox_keep_running() {
+  local name="$1" pf pid
+  pf="$(_ebox_keep_pidfile "$name")"
+  [ -f "$pf" ] || return 1
+  pid="$(cat "$pf" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # confirm it's our worker
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "__keep_worker $name" || return 1
+  return 0
+}
+
+_ebox_keep_stop() {
+  local name="$1" pf pid
+  pf="$(_ebox_keep_pidfile "$name")"
+  if [ -f "$pf" ]; then
+    pid="$(cat "$pf" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      # orphans: kill matching workers by name
+      sleep 0.2
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$pf"
+  fi
+  # belt-and-suspenders: any leftover workers for this name
+  pkill -f "__keep_worker $name( |$)" 2>/dev/null || true
+}
+
+_ebox_keep_loop() {
+  local name="$1" sid timeout interval idle
+  local deadline now remaining act vnc_active
+  sid="$(_ebox_resolve_id "$name")"
+  timeout="$(_ebox_project_timeout)"
+  interval="$(_ebox_keepalive_interval "$timeout")"
+  idle="${EBOX_KEEPALIVE_IDLE}"
+  # Intended pause deadline. activity()/Sandbox.connect() resets TTL as a side
+  # effect — when idle we claw back to this deadline so coffee still sleeps.
+  deadline=$(( $(date +%s) + timeout ))
+  echo "› keep $name ($sid)  timeout=${timeout}s interval=${interval}s idle<${idle}s"
+  echo "  hybrid: VNC connected AND X11 idle < ${idle}s (forgotten tabs expire)"
+  echo "  note: activity connect would extend TTL; idle claws back to deadline"
+  while true; do
+    now=$(date +%s)
+    remaining=$(( deadline - now ))
+    if [ "$remaining" -le 0 ]; then
+      echo "· $(date -Iseconds) deadline reached — stopping keep (box should pause)"
+      _ebox_api set_timeout "$sid" 1 >/dev/null 2>&1 || true
+      return 0
+    fi
+    act="$(_ebox_api activity "$sid" --idle-secs "$idle" 2>/dev/null)" || act=""
+    # connect() just reset TTL to ~60s — decide extend vs clawback
+    vnc_active="$(jq -r '.vnc_active // false' <<<"$act" 2>/dev/null || echo false)"
+    if [ "$vnc_active" = "true" ]; then
+      deadline=$(( $(date +%s) + timeout ))
+      _ebox_api set_timeout "$sid" "$timeout" >/dev/null 2>&1 || true
+      echo "♥ $(date -Iseconds) vnc_active idle_ms=$(jq -r '.idle_ms' <<<"$act") clients=$(jq -r '.vnc_clients' <<<"$act") deadline=$(date -d "@$deadline" -Iseconds 2>/dev/null || echo $deadline)"
+    else
+      now=$(date +%s)
+      remaining=$(( deadline - now ))
+      if [ "$remaining" -lt 1 ]; then remaining=1; fi
+      _ebox_api set_timeout "$sid" "$remaining" >/dev/null 2>&1 || true
+      echo "· $(date -Iseconds) idle claw→${remaining}s — $(jq -c '{vnc_clients,idle_ms,vnc_active,error}' <<<"${act:-}" 2>/dev/null || echo "${act:-none}")"
+      if [ "$remaining" -le "$interval" ]; then
+        echo "· $(date -Iseconds) final grace ${remaining}s — stopping keep"
+        return 0
+      fi
+    fi
+    sleep "$interval"
+  done
+}
+
+_ebox_keep_start() {
+  local name="$1" pf lf self
+  mkdir -p "$EBOX_KEEP_DIR"
+  if _ebox_keep_running "$name"; then
+    echo "› keep already running for $name (pid $(cat "$(_ebox_keep_pidfile "$name")"))"
+    return 0
+  fi
+  _ebox_keep_stop "$name" >/dev/null 2>&1 || true
+  pf="$(_ebox_keep_pidfile "$name")"
+  lf="$(_ebox_keep_logfile "$name")"
+  self="$(readlink -f "${BASH_SOURCE[0]:-$HOME/.local/scripts/ebox}")"
+  (
+    exec -a "__keep_worker $name" bash -c '
+      set -euo pipefail
+      # shellcheck disable=SC1090
+      source "$1"
+      _ebox_keep_loop "$2"
+    ' bash "$self" "$name"
+  ) >>"$lf" 2>&1 &
+  echo $! >"$pf"
+  disown $! 2>/dev/null || true
+  echo "› keep started for $name (pid $(cat "$pf")) → $lf"
+}
+
+cmd_keep() {
   _ebox_ensure
-  local name sid
+  local name mode="status"
+  # usage: ebox keep [name] [--start|--stop|--fg|--status]
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --start) mode=start; shift ;;
+      --stop) mode=stop; shift ;;
+      --fg) mode=fg; shift ;;
+      --status) mode=status; shift ;;
+      -*) die "usage: ebox keep [name] [--start|--stop|--fg|--status]" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="$(_ebox_pick_box "${name:-}")" || exit 1
+  case "$mode" in
+    start) _ebox_keep_start "$name" ;;
+    stop) _ebox_keep_stop "$name"; echo "✓ keep stopped $name" ;;
+    fg) _ebox_keep_stop "$name" >/dev/null 2>&1 || true; _ebox_keep_loop "$name" ;;
+    status)
+      if _ebox_keep_running "$name"; then
+        echo "keep $name running pid=$(cat "$(_ebox_keep_pidfile "$name")") log=$(_ebox_keep_logfile "$name")"
+      else
+        echo "keep $name not running"
+      fi
+      ;;
+  esac
+}
+
+cmd_activity() {
+  _ebox_ensure
+  local name sid idle
   name="$(_ebox_pick_box "${1:-}")" || exit 1
   sid="$(_ebox_resolve_id "$name")"
-  echo "› ebox $name ($sid)"
-  exec e2b sbx connect "$sid"
+  idle="${EBOX_KEEPALIVE_IDLE}"
+  _ebox_api activity "$sid" --idle-secs "$idle"
+}
+
+cmd_console() {
+  _ebox_ensure
+  local name sid timeout interval idle
+  name="$(_ebox_pick_box "${1:-}")" || exit 1
+  sid="$(_ebox_resolve_id "$name")"
+  timeout="$(_ebox_project_timeout)"
+  interval="$(_ebox_keepalive_interval "$timeout")"
+  idle="${EBOX_KEEPALIVE_IDLE}"
+  echo "› ebox $name ($sid)  keepalive ${timeout}s every ${interval}s (PTY I/O idle<${idle}s)"
+  echo "  beats TTL only on recent console stdin/stdout — idle prompt / coffee → sleep"
+  # PTY wrapper watches real traffic (stdin OR stdout). Attached≠active.
+  # Quiet agent gaps under idle threshold still count as active.
+  _ebox_api console_session "$sid" --timeout "$timeout" --idle-secs "$idle" --interval "$interval"
 }
 
 cmd_url() {
@@ -662,13 +843,21 @@ cmd_url() {
 }
 
 cmd_open() {
-  local name url
+  local name url vnc
   name="$(_ebox_pick_box "${1:-}")" || exit 1
+  # Opening the box implies interest — wake web/desktop and start VNC keep if desktop.
+  cmd_wake "$name" >/dev/null 2>&1 || true
   url="$(_ebox_friendly_url "$name")"
+  vnc="$(_ebox_vnc_url "$name")"
   if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$url" >/dev/null 2>&1 &
+    if [ -n "$vnc" ]; then
+      xdg-open "$vnc" >/dev/null 2>&1 &
+    else
+      xdg-open "$url" >/dev/null 2>&1 &
+    fi
   else
     echo "$url"
+    [ -n "$vnc" ] && echo "$vnc"
   fi
 }
 
@@ -677,20 +866,27 @@ cmd_pause() {
   local name sid
   name="$(_ebox_pick_box "${1:-}")" || exit 1
   sid="$(_ebox_resolve_id "$name")"
+  _ebox_keep_stop "$name" >/dev/null 2>&1 || true
   e2b sbx pause "$sid"
   echo "✓ paused $name"
 }
 
 cmd_wake() {
   _ebox_ensure
-  local name sid port vnc
+  local name sid port vnc timeout
   name="$(_ebox_pick_box "${1:-}")" || exit 1
   sid="$(_ebox_resolve_id "$name")"
   port="$(_ebox_get "$name" app_port)"
   port="${port:-$EBOX_APP_PORT}"
+  timeout="$(_ebox_project_timeout)"
   _ebox_api ensure_web "$sid" "$port" >/dev/null
   _ebox_ensure_desktop "$name" || true
-  echo "✓ awake $name  $(_ebox_friendly_url "$name")"
+  # Reset TTL on wake; desktop boxes get hybrid VNC keepalive in background.
+  _ebox_api set_timeout "$sid" "$timeout" >/dev/null 2>&1 || true
+  if _ebox_is_desktop "$name"; then
+    _ebox_keep_start "$name" || true
+  fi
+  echo "✓ awake $name  $(_ebox_friendly_url "$name")  ttl=${timeout}s"
   vnc="$(_ebox_vnc_url "$name")"
   [ -n "$vnc" ] && echo "  VNC  $vnc"
 }
@@ -709,6 +905,7 @@ cmd_rm() {
   name="$(_ebox_pick_box "${1:-}")" || exit 1
   sid="$(_ebox_resolve_id "$name")"
   echo "› killing '$name' ($sid) forever…"
+  _ebox_keep_stop "$name" >/dev/null 2>&1 || true
   e2b sbx kill "$sid" 2>/dev/null || true
   _ebox_del "$name"
   cmd_proxy >/dev/null 2>&1 || true
@@ -763,6 +960,8 @@ ebox — E2B multi-base boxes (chad-style carbon copies)
   ebox ls | list
   ebox console | go [name]
   ebox url | open | proxy | pause | wake | id
+  ebox activity [name]     hybrid VNC activity probe
+  ebox keep [name] [--start|--stop|--fg|--status]
   ebox trust               install Caddy CA into Chrome NSS trust store
   ebox rm [name]           kill forever
   ebox help
@@ -798,6 +997,8 @@ main() {
     trust) cmd_trust ;;
     pause|ps) shift; cmd_pause "$@" ;;
     wake|resume|rs) shift; cmd_wake "$@" ;;
+    activity) shift; cmd_activity "$@" ;;
+    keep) shift; cmd_keep "$@" ;;
     id) shift; cmd_id "$@" ;;
     rm|remove|kill|destroy) shift; cmd_rm "$@" ;;
     help|-h|--help) cmd_help ;;

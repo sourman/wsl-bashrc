@@ -17,7 +17,7 @@ kayes() {
 }
 
 # Peek at the last N supabase migrations (default 5)
-rukn() { npx supabase migration list | tail -"${1:-5}"; }
+rukn() { supabase migration list | tail -"${1:-5}"; }
 
 # Trick Cursor's terminal tool into waiting — it skips bare `sleep N` calls
 holdon() { sleep "$(($1))"; }
@@ -727,3 +727,15 @@ bun() {
   fi
   command bun "$@"
 }
+
+# ============================================================================
+# box — remote sticky boxes (Sprites). wt-shaped; does not touch wt.
+# Implementation: ~/.local/bin/box  |  help: box help
+# ============================================================================
+box() { command box "$@"; }
+
+# ============================================================================
+# ebox — E2B boxes with human names. Parallel to `box` (Sprites). Leaves wt alone.
+# Implementation: ~/.local/bin/ebox  |  help: ebox help
+# ============================================================================
+ebox() { command ebox "$@"; }

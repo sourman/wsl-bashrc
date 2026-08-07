@@ -6,6 +6,12 @@
 # If not running interactively, don't do anything
 [ -z "$PS1" ] && return
 
+# Reset the kitty keyboard protocol on every new shell. Neovim 0.10 enables
+# CSI u at startup; if it crashes or is killed, VTE stays stuck in that mode
+# and ESC is re-encoded as CSI 27 u -- which most apps (vim, less, fzf, ...)
+# do not recognize, so ESC silently stops working inside them. This pops the
+# protocol stack and disables all flags, restoring raw key delivery.
+printf '\033[<u\033[>0u' 2>/dev/null
 # ble.sh — must be the very FIRST thing (before any other readline/prompt setup)
 # so it can hook the line editor. --noattach defers actual attachment until the
 # end of the file (after starship). fish/zsh-style autosuggestions + syntax hl.
@@ -126,14 +132,14 @@ fi
 # ============================================================================
 
 # bun (package manager / runtime)
-if [ -d "$HOME/.bun/bin" ] ; then
-    PATH="$HOME/.bun/bin:$PATH"
-fi
-
-# bun global bin — where `bun install -g` drops executables (e.g. mcporter).
-# bun resolves this to $XDG_CACHE_HOME/.bun/bin (defaults to ~/.cache/.bun/bin).
-if [ -d "${XDG_CACHE_HOME:-$HOME/.cache}/.bun/bin" ] ; then
-    PATH="${XDG_CACHE_HOME:-$HOME/.cache}/.bun/bin:$PATH"
+# BUN_INSTALL anchors the runtime AND the global install layout:
+#   bin shims -> $BUN_INSTALL/bin            (~/.bun/bin)
+#   packages  -> $BUN_INSTALL/install/global (~/.bun/install/global)
+# Without it, bun 1.3.x runs unanchored and drops globals in ~/node_modules
+# with bins in ~/.cache/.bun/bin (XDG fallback). See oven-sh/bun install.sh.
+export BUN_INSTALL="$HOME/.bun"
+if [ -d "$BUN_INSTALL/bin" ] ; then
+    PATH="$BUN_INSTALL/bin:$PATH"
 fi
 
 # nvm (Node.js version manager)
@@ -202,11 +208,19 @@ fi
 # victim that actually has one; commands without a native script keep fzf's
 # path fallback (correct). Must run AFTER fzf and BEFORE ble-attach so the right
 # registration is in place when ble attaches.
+#
+# Separately: fzf also replaces bash-completion's `complete -D` lazy loader
+# (`_comp_complete_load`) with `__fzf_default_completion` (path picker). Commands
+# NOT in the Anything list (e.g. `gh`) never get stamped, so they never get
+# restored above AND never lazy-load via -D — Tab falls through to fzf paths.
+# Preload those explicitly here. Same loader, same timing, no new framework.
 # ----------------------------------------------------------------------------
 if declare -F _completion_loader >/dev/null 2>&1; then
   while read -r _cmd; do
     [ -n "$_cmd" ] && _completion_loader "$_cmd" 2>/dev/null
   done < <(complete -p 2>/dev/null | awk '/_fzf_path_completion/{print $NF}' | sort -u)
+  # -D victims (not in fzf's Anything list; need explicit preload)
+  _completion_loader gh 2>/dev/null
 fi
 
 # Starship prompt (git-aware, nerd-font powerline) — overrides PS1 above
@@ -217,3 +231,6 @@ if [[ ${BLE_VERSION-} ]]; then
   ble-attach
 fi
 export PATH="$HOME/.deno/bin:$PATH"
+
+# The next line updates PATH for the Google Cloud SDK.
+if [ -f '/home/ahmed/google-cloud-sdk/path.bash.inc' ]; then . '/home/ahmed/google-cloud-sdk/path.bash.inc'; fi

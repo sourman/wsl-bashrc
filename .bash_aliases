@@ -18,6 +18,6 @@ alias docket='docker'
 
 # Tool aliases
 alias supabase='npx supabase'
-alias sb='npx supabase'
 alias claude='claude --dangerously-skip-permissions'
 alias rm='trash'
+alias sb='supabase'
