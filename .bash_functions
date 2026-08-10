@@ -252,12 +252,13 @@ _wt_render_supabase() {
 # proxy dev URL host for a worktree (feat-x.cora.test); empty for a legacy
 # worktree with no routeable port (no .vite-port -> wt adopt).
 _wt_url_for() {
-  local path="$1" app="${2:-}" port name
+  local path="$1" app="${2:-}" port name slug
   if [ -d "$path/.git" ]; then port=8080
   else port="$(_wt_vite_port_for_path "$path")"; fi
   [ -n "$port" ] && [ -n "$app" ] || return 0
   name="$(basename "$path")"
-  printf '%s.%s.test' "$(_wt_slug "$name")" "$app"
+  slug="$(_cora_host_slug wt "$name")"
+  printf '%s.%s.test' "$slug" "$app"
 }
 
 # name<TAB>branch<TAB>path<TAB>vite<TAB>supabase  (lookups computed once)
@@ -332,6 +333,11 @@ _wt_edge_report() {
   done <<<"$_WT_SERVE"
 }
 
+
+# Shared wt/ebox DNS collision helpers (-wt / -ebox suffixes on name clash).
+CORA_DNS_SH="${CORA_DNS_SH:-$HOME/.local/scripts/cora-dns.sh}"
+[ -f "$CORA_DNS_SH" ] && source "$CORA_DNS_SH"
+
 # ============================================================================
 # wt — local dev DNS via Caddy. Visit <worktree>.<app>.test (plus -local /
 # -preview variants) instead of localhost:<port>. `wt proxy` rewrites a managed
@@ -369,7 +375,7 @@ _wt_routes() {
       printf 'wt proxy: skip %s (no .vite-port -- run: wt adopt %s)\n' "$name" "$name" >&2
       continue
     fi
-    sub="$(_wt_slug "$name")"   # <slug>.<app>.test (main is cora.cora.test by design)
+    sub="$(_cora_host_slug wt "$name")"   # <slug>.<app>.test; -wt suffix on ebox collision
     for m in '' '-local' '-preview'; do
       p=$port
       [ "$m" = '-local' ] && p=$((port + 1))
@@ -391,7 +397,7 @@ _wt_proxy_apply() {
   { echo "# BEGIN wt-proxy (managed by wt proxy)"; printf '%s\n' "$hosts"; echo "# END wt-proxy"; } >> "$tmp"
   sudo cp "$tmp" /etc/hosts && rm -f "$tmp"
   printf '%s' "$caddy" | sudo tee /etc/caddy/wt-routes.caddy >/dev/null
-  sudo systemctl reload caddy
+  _cora_caddy_reload || return 1
   echo "Routes:"
   printf '%s' "$routes" | awk -F'\t' '{printf "  https://%s -> %s\n", $1, $2}'
 }
@@ -662,6 +668,7 @@ wt — worktree navigator (jump is the default)
   wt prune          prune stale worktree refs
   wt proxy         (re)generate local dev DNS: <worktree>.cora.test -> vite port
                     via Caddy (tls internal). Re-run after wt new / rm / adopt.
+                    If an ebox shares the name: <worktree>-wt.cora.test instead.
   wt adopt [name]  assign a sticky .vite-port (9xxx) to a legacy worktree so it
                     gets its own dev URL too (all, or one worktree name)
 

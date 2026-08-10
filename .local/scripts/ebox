@@ -24,6 +24,13 @@ EBOX_APP_PORT="${EBOX_APP_PORT:-8080}"
 # or <cwd-basename>.test when not in git. Never uses a linked worktree folder name.
 EBOX_CADDY_ROUTES="${EBOX_CADDY_ROUTES:-/etc/caddy/ebox-routes.caddy}"
 EBOX_TOML_NAME="${EBOX_TOML_NAME:-.ebox.toml}"
+CORA_DNS_SH="${CORA_DNS_SH:-$HOME/.local/scripts/cora-dns.sh}"
+[ -f "$CORA_DNS_SH" ] && source "$CORA_DNS_SH"
+
+_ebox_dns_context() {
+  CORA_GIT_ROOT="$(_ebox_main_repo_root 2>/dev/null || _ebox_git_toplevel 2>/dev/null || true)"
+  export CORA_GIT_ROOT
+}
 
 die() { echo "ebox: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
@@ -154,7 +161,8 @@ _ebox_zone_for() {
 
 _ebox_friendly_host() {
   local name="$1"
-  printf '%s.%s' "$(_ebox_slug "$name")" "$(_ebox_zone_for "$name")"
+  _ebox_dns_context
+  printf '%s.%s' "$(_cora_host_slug ebox "$name")" "$(_ebox_zone_for "$name")"
 }
 _ebox_friendly_url() { printf 'https://%s' "$(_ebox_friendly_host "$1")"; }
 _ebox_upstream() {
@@ -194,7 +202,8 @@ _ebox_is_desktop() {
 
 _ebox_vnc_friendly_host() {
   local name="$1"
-  printf '%s-vnc.%s' "$(_ebox_slug "$name")" "$(_ebox_zone_for "$name")"
+  _ebox_dns_context
+  printf '%s-vnc.%s' "$(_cora_host_slug ebox "$name")" "$(_ebox_zone_for "$name")"
 }
 
 _ebox_vnc_upstream() {
@@ -558,6 +567,7 @@ cmd_default() {
 # ── proxy / lifecycle (unchanged spirit) ────────────────────────────────────
 cmd_proxy() {
   _ebox_ensure
+  _ebox_dns_context
   need caddy
   local name sid port host upstream routes="" hosts_block caddy_block tmp
 
@@ -595,7 +605,7 @@ cmd_proxy() {
   else
     printf '%s' "$caddy_block" | sudo tee "$EBOX_CADDY_ROUTES" >/dev/null
   fi
-  sudo systemctl reload caddy
+  _cora_caddy_reload || die "caddy reload failed (run: sudo caddy validate --config /etc/caddy/Caddyfile)"
 
   echo "Routes:"
   if [ -z "$routes" ]; then
@@ -607,6 +617,7 @@ cmd_proxy() {
 
 cmd_ls() {
   _ebox_ensure
+  _ebox_dns_context
   local name sid port state url up live proj
   live="$(_ebox_live_json)"
   printf 'NAME\tSTATE\tURL\tUPSTREAM\n'
@@ -975,7 +986,8 @@ Lifecycle: idle ${EBOX_TIMEOUT}s → pause (free, forever). rm = permanent.
 DNS: https://<box>.<repo>.test  (repo = main git folder via git-common-dir,
      not the worktree leaf name). Override: EBOX_DNS_ZONE=foo.test
      Stored per box at create; \`ebox proxy\` wires Caddy/hosts.
-     Desktop boxes also get https://<box>-vnc.<repo>.test (auto-started on create/wake).
+     If a worktree shares the name: https://<box>-ebox.<repo>.test instead.
+     Desktop boxes also get https://<box>-ebox-vnc.<repo>.test (auto-started on create/wake).
      If Chrome says the site is unsafe: \`ebox trust\` then restart Chrome.
 Config: $EBOX_TOML_NAME at git root · registry: $EBOX_REGISTRY
 EOF
