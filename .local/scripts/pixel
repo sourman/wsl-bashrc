@@ -13,19 +13,77 @@ set -euo pipefail
 
 PHONE_HOST="${PIXEL_HOST:-pixel-7}"
 ADB_PORT="${PIXEL_ADB_PORT:-5555}"
+ADB_TIMEOUT="${PIXEL_ADB_TIMEOUT:-5}"
+PING_TIMEOUT="${PIXEL_PING_TIMEOUT:-3}"
+
+fail() {
+  echo "pixel: $*" >&2
+  exit 1
+}
+
+note() {
+  echo "pixel: $*" >&2
+}
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  fail "tailscale is not installed or not on PATH"
+fi
+
+if ! command -v adb >/dev/null 2>&1; then
+  fail "adb is not installed or not on PATH"
+fi
+
+if ! command -v scrcpy >/dev/null 2>&1; then
+  fail "scrcpy is not installed or not on PATH"
+fi
 
 if [[ -n "${PIXEL_IP:-}" ]]; then
   ip="$PIXEL_IP"
+  peer_line=""
 else
-  ip="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }')"
-fi
+  peer_line="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print; exit }' || true)"
+  if [[ -z "$peer_line" ]]; then
+    fail "could not find Tailscale peer '$PHONE_HOST' on your tailnet (is tailscale running?)"
+  fi
 
-if [[ -z "${ip:-}" ]]; then
-  echo "pixel: could not find Tailscale peer '$PHONE_HOST' (is tailscale up?)" >&2
-  exit 1
+  ip="${peer_line%% *}"
+
+  if [[ "$peer_line" == *"offline"* ]]; then
+    last_seen="$(sed -n 's/.*last seen \([^,]*\).*/\1/p' <<<"$peer_line")"
+    if [[ -n "$last_seen" ]]; then
+      fail "$PHONE_HOST ($ip) is offline on Tailscale (last seen $last_seen). Wake the phone and make sure the Tailscale app is running."
+    fi
+    fail "$PHONE_HOST ($ip) is offline on Tailscale. Wake the phone and make sure the Tailscale app is running."
+  fi
 fi
 
 target="${ip}:${ADB_PORT}"
 
-adb connect "$target" >/dev/null 2>&1 || true
+if ! tailscale ping -c 1 -timeout "${PING_TIMEOUT}s" "$ip" >/dev/null 2>&1; then
+  fail "cannot reach $PHONE_HOST at $ip over Tailscale (ping timed out after ${PING_TIMEOUT}s). The phone may be asleep or off-network."
+fi
+
+note "connecting to $PHONE_HOST at $target ..."
+
+adb_out=""
+if ! adb_out="$(timeout "$ADB_TIMEOUT" adb connect "$target" 2>&1)"; then
+  rc=$?
+  if [[ "$rc" -eq 124 ]]; then
+    fail "ADB on $target did not answer within ${ADB_TIMEOUT}s. The phone is reachable on Tailscale, but wireless ADB is not up (unlock the phone, or replug USB once and run: adb tcpip $ADB_PORT)."
+  fi
+  if [[ -n "$adb_out" ]]; then
+    fail "adb connect $target failed: $adb_out"
+  fi
+  fail "adb connect $target failed (exit $rc)"
+fi
+
+if [[ "$adb_out" == *"failed"* ]] || [[ "$adb_out" == *"refused"* ]]; then
+  fail "adb connect $target failed: $adb_out"
+fi
+
+if ! timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1; then
+  fail "connected to $target, but ADB is not responding. Unlock the phone and try again."
+fi
+
+note "launching scrcpy ..."
 exec scrcpy --tcpip="$target" "$@"
