@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Launch scrcpy to the Pixel 7 over Tailscale ADB.
+#
+# Usage:
+#   pixel              mirror the phone
+#   pixel --no-audio   pass any scrcpy flags through
+#
+# Override target:
+#   PIXEL_HOST=pixel-7 PIXEL_ADB_PORT=5555 pixel
+#   PIXEL_IP=100.85.191.25 pixel
+
+set -euo pipefail
+
+PHONE_HOST="${PIXEL_HOST:-pixel-7}"
+ADB_PORT="${PIXEL_ADB_PORT:-5555}"
+
+if [[ -n "${PIXEL_IP:-}" ]]; then
+  ip="$PIXEL_IP"
+else
+  ip="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }')"
+fi
+
+if [[ -z "${ip:-}" ]]; then
+  echo "pixel: could not find Tailscale peer '$PHONE_HOST' (is tailscale up?)" >&2
+  exit 1
+fi
+
+target="${ip}:${ADB_PORT}"
+
+adb connect "$target" >/dev/null 2>&1 || true
+exec scrcpy --tcpip="$target" "$@"
