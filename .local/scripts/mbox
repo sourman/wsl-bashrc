@@ -1,0 +1,1013 @@
+#!/usr/bin/env bash
+# mbox — Morph devboxes with human names, multi-base carbon-copies (chad-style).
+# Does NOT touch `box` or `wt`.
+#
+#   mbox                      no .mbox.toml → init wizard; else fzf → console
+#   mbox new <name>           fzf parent (bases | boxes | seeds) → create
+#   mbox base [box] [--as N]  bless box snapshot as named project base
+#   mbox default <base>       set default_base in .mbox.toml
+#   mbox ls / url / open / proxy / pause / wake / console / rm / id
+#   mbox activity / keep   (keep auto-starts on wake/open for desktop)
+#
+# Idle: timeout → pause (kept forever, free). mbox rm = kill forever.
+# Desktop: wake/open auto-starts hybrid VNC keepalive in background.
+set -euo pipefail
+
+MBOX_DIR="${MBOX_DIR:-$HOME/.config/mbox}"
+MBOX_REGISTRY="${MBOX_REGISTRY:-$MBOX_DIR/registry.json}"
+MBOX_PY="${MBOX_PY:-$HOME/.local/share/mbox/venv/bin/python}"
+MBOX_API="${MBOX_API:-$HOME/.local/scripts/mbox_api.py}"
+MBOX_MORPHCLI="${MBOX_MORPHCLI:-$(command -v morphcloud 2>/dev/null || echo "$HOME/.local/share/mbox/venv/bin/morphcloud")}"
+MBOX_TIMEOUT="${MBOX_TIMEOUT:-60}"
+MBOX_KEEPALIVE_IDLE="${MBOX_KEEPALIVE_IDLE:-120}"  # console PTY I/O + VNC X11 idle threshold
+MBOX_APP_PORT="${MBOX_APP_PORT:-8080}"
+# Optional override (e.g. export MBOX_DNS_ZONE=foo.test). Default: <main-repo>.test
+# or <cwd-basename>.test when not in git. Never uses a linked worktree folder name.
+MBOX_CADDY_ROUTES="${MBOX_CADDY_ROUTES:-/etc/caddy/mbox-routes.caddy}"
+MBOX_TOML_NAME="${MBOX_TOML_NAME:-.mbox.toml}"
+CORA_DNS_SH="${CORA_DNS_SH:-$HOME/.local/scripts/cora-dns.sh}"
+[ -f "$CORA_DNS_SH" ] && source "$CORA_DNS_SH"
+
+_mbox_dns_context() {
+  CORA_GIT_ROOT="$(_mbox_main_repo_root 2>/dev/null || _mbox_git_toplevel 2>/dev/null || true)"
+  export CORA_GIT_ROOT
+}
+
+die() { echo "mbox: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+_mbox_ensure() {
+  mkdir -p "$MBOX_DIR"
+  [ -f "$MBOX_REGISTRY" ] || echo '{}' >"$MBOX_REGISTRY"
+  [ -x "$MBOX_PY" ] || die "missing $MBOX_PY"
+  [ -f "$MBOX_API" ] || die "missing $MBOX_API"
+  [ -x "$MBOX_MORPHCLI" ] || need morphcloud
+  need jq
+  need fzf
+}
+
+_mbox_api() { "$MBOX_PY" "$MBOX_API" "$@"; }
+
+# Linked worktree path (may be ~/.cursor/worktrees/cora/feat-x).
+_mbox_git_toplevel() {
+  git rev-parse --show-toplevel 2>/dev/null || true
+}
+
+# Primary repo checkout path (parent of .git), NOT a worktree leaf name.
+_mbox_main_repo_root() {
+  local common
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  common="${common%/}"
+  if [[ "$common" == */.git ]]; then
+    dirname "$common"
+  else
+    # Unusual layouts — best effort
+    dirname "$common"
+  fi
+}
+
+# DNS apex label: main git folder name, else cwd basename. Worktree-safe.
+_mbox_dns_apex() {
+  local root
+  if [ -n "${MBOX_DNS_ZONE:-}" ]; then
+    # full zone override → apex is zone without .test if present
+    printf '%s' "${MBOX_DNS_ZONE%.test}"
+    return 0
+  fi
+  root="$(_mbox_main_repo_root 2>/dev/null)" || root=""
+  if [ -z "$root" ]; then
+    root="$PWD"
+  fi
+  _mbox_slug "$(basename "$root")"
+}
+
+_mbox_dns_zone() {
+  if [ -n "${MBOX_DNS_ZONE:-}" ]; then
+    printf '%s' "$MBOX_DNS_ZONE"
+    return 0
+  fi
+  printf '%s.test' "$(_mbox_dns_apex)"
+}
+
+# .mbox.toml: prefer current worktree copy if present, else main checkout, else create path.
+_mbox_toml_path() {
+  local wt main
+  wt="$(_mbox_git_toplevel)"
+  main="$(_mbox_main_repo_root 2>/dev/null)" || main=""
+  if [ -n "$wt" ] && [ -f "$wt/$MBOX_TOML_NAME" ]; then
+    printf '%s/%s' "$wt" "$MBOX_TOML_NAME"
+  elif [ -n "$main" ] && [ -f "$main/$MBOX_TOML_NAME" ]; then
+    printf '%s/%s' "$main" "$MBOX_TOML_NAME"
+  elif [ -n "$wt" ]; then
+    printf '%s/%s' "$wt" "$MBOX_TOML_NAME"
+  elif [ -n "$main" ]; then
+    printf '%s/%s' "$main" "$MBOX_TOML_NAME"
+  else
+    return 1
+  fi
+}
+
+_mbox_has_project() {
+  local p
+  p="$(_mbox_toml_path 2>/dev/null)" || return 1
+  [ -f "$p" ]
+}
+
+_mbox_project_json() {
+  local p
+  p="$(_mbox_toml_path)" || die "not inside a git repo — mbox project config lives at repo root"
+  [ -f "$p" ] || die "no $MBOX_TOML_NAME — run: mbox"
+  _mbox_api project get "$p"
+}
+
+_mbox_names() { jq -r 'keys[]' "$MBOX_REGISTRY" 2>/dev/null | sort; }
+
+_mbox_get() {
+  local name="$1" field="${2:-}"
+  if [ -n "$field" ]; then
+    jq -r --arg n "$name" --arg f "$field" '.[$n][$f] // empty' "$MBOX_REGISTRY"
+  else
+    jq -c --arg n "$name" '.[$n] // empty' "$MBOX_REGISTRY"
+  fi
+}
+
+_mbox_put() {
+  local name="$1" json="$2" tmp
+  tmp="$(mktemp)"
+  jq --arg n "$name" --argjson v "$json" '.[$n]=$v' "$MBOX_REGISTRY" >"$tmp"
+  mv "$tmp" "$MBOX_REGISTRY"
+}
+
+_mbox_del() {
+  local name="$1" tmp
+  tmp="$(mktemp)"
+  jq --arg n "$name" 'del(.[$n])' "$MBOX_REGISTRY" >"$tmp"
+  mv "$tmp" "$MBOX_REGISTRY"
+}
+
+_mbox_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+# Per-box zone (stored at create). Legacy entries fall back to current context zone.
+_mbox_zone_for() {
+  local name="$1" z
+  z="$(_mbox_get "$name" dns_zone)"
+  if [ -n "$z" ]; then
+    printf '%s' "$z"
+  else
+    _mbox_dns_zone
+  fi
+}
+
+_mbox_friendly_host() {
+  local name="$1"
+  _mbox_dns_context
+  printf '%s.%s' "$(_cora_host_slug mbox "$name")" "$(_mbox_zone_for "$name")"
+}
+_mbox_friendly_url() { printf 'https://%s' "$(_mbox_friendly_host "$1")"; }
+_mbox_upstream_app() {
+  local name="$1"
+  local up
+  up="$(_mbox_get "$name" app_upstream)"
+  if [ -n "$up" ]; then
+    printf '%s' "$up"
+    return 0
+  fi
+  local sid port
+  sid="$(_mbox_id "$name")"
+  port="$(_mbox_get "$name" app_port)"
+  port="${port:-$MBOX_APP_PORT}"
+  _mbox_api url "$sid" "$port" 2>/dev/null || printf ''
+}
+
+_mbox_upstream_vnc() {
+  local name="$1"
+  local up
+  up="$(_mbox_get "$name" vnc_upstream)"
+  if [ -n "$up" ]; then
+    printf '%s' "$up"
+    return 0
+  fi
+  jq -r --arg n "$name" '.[$n].morph_desktop_url // empty' "$MBOX_REGISTRY" 2>/dev/null
+}
+
+_mbox_id() {
+  local name="$1" id
+  id="$(_mbox_get "$name" devbox_id)"
+  [ -n "$id" ] || id="$(_mbox_get "$name" sandbox_id)"
+  printf '%s' "$id"
+}
+
+MBOX_VNC_PORT="${MBOX_VNC_PORT:-6080}"
+
+# Desktop boxes: template/seed "desktop" (and snapshot forks of those bases).
+_mbox_is_desktop() {
+  local name="$1" ref seed
+  ref="$(jq -r --arg n "$name" '.[$n].source.ref // empty' "$MBOX_REGISTRY" 2>/dev/null)"
+  if [ "$ref" = "desktop" ]; then
+    return 0
+  fi
+  if _mbox_has_project 2>/dev/null; then
+    seed="$(
+      _mbox_project_json 2>/dev/null | jq -r --arg n "$name" --arg ref "$ref" '
+        .bases
+        | to_entries[]
+        | select(
+            (.value.seed // "") == "desktop"
+            and (
+              .value.source_box == $n
+              or .value.snapshot == $ref
+              or .key == $n
+            )
+          )
+        | .value.seed
+        | select(. == "desktop")
+      ' 2>/dev/null | head -n1
+    )"
+    [ "$seed" = "desktop" ] && return 0
+  fi
+  return 1
+}
+
+_mbox_vnc_friendly_host() {
+  local name="$1"
+  _mbox_dns_context
+  printf '%s-vnc.%s' "$(_cora_host_slug mbox "$name")" "$(_mbox_zone_for "$name")"
+}
+
+_mbox_vnc_upstream() {
+  local name="$1"
+  _mbox_upstream_vnc "$name"
+}
+
+_mbox_ensure_desktop() {
+  # Morph headed templates ship desktop in the template; wake resumes the devbox.
+  _mbox_is_desktop "$1" || return 0
+  return 0
+}
+
+# Friendly noVNC URL when desktop; empty otherwise.
+_mbox_vnc_url() {
+  local name="$1" sid up md
+  _mbox_is_desktop "$name" || { printf ''; return 0; }
+  sid="$(_mbox_id "$name")"
+  [ -n "$sid" ] || { printf ''; return 0; }
+  up="$(_mbox_upstream_vnc "$name")"
+  if [[ "$up" == *cloud.morph.so* ]]; then
+    printf '%s' "$up"
+    return 0
+  fi
+  if [ -n "$up" ]; then
+    printf 'https://%s/vnc.html?autoconnect=true&resize=scale' "$(_mbox_vnc_friendly_host "$name")"
+    return 0
+  fi
+  md="$(jq -r --arg n "$name" '.[$n].morph_desktop_url // empty' "$MBOX_REGISTRY" 2>/dev/null)"
+  printf '%s' "$md"
+}
+
+
+_mbox_live_json() {
+  "$MBOX_MORPHCLI" devbox list --json 2>/dev/null || echo '{"data":[]}'
+}
+
+_mbox_state_for() {
+  local sid="$1" live="${2:-}"
+  [ -n "$live" ] || live="$(_mbox_live_json)"
+  jq -r --arg id "$sid" '
+    (.data // []) | map(select(.id==$id))[0].status // "missing"
+  ' <<<"$live" | tr '[:upper:]' '[:lower:]'
+}
+
+_mbox_fzf() {
+  # stdin: display\tvalue lines; optional header via MBOX_FZF_HEADER
+  local prompt="${1:-mbox> }" had_ble=0 picked
+  if [[ ${BLE_VERSION-} ]] && declare -F ble/decode/detach >/dev/null 2>&1; then
+    had_ble=1; ble/decode/detach
+  fi
+  picked="$(fzf --prompt="$prompt" --height=50% --reverse --delimiter=$'\t' \
+    --with-nth=1 ${MBOX_FZF_HEADER:+--header="$MBOX_FZF_HEADER"} \
+    | awk -F'\t' '{print $2}')" || true
+  if (( had_ble )) && declare -F ble/decode/attach >/dev/null 2>&1; then
+    ble/decode/attach
+  fi
+  [ -n "$picked" ] || return 1
+  printf '%s' "$picked"
+}
+
+_mbox_pick_box() {
+  local query="${1:-}" names matches count live
+  names="$(_mbox_names)"
+  [ -n "$names" ] || die "no mboxes — try: mbox new <name>"
+  if [ -n "$query" ]; then
+    matches="$(printf '%s\n' "$names" | awk -v q="$query" 'index($0,q)')"
+    count="$(printf '%s\n' "$matches" | grep -c . || true)"
+    if [ "$count" -eq 1 ]; then
+      printf '%s' "$matches"
+      return 0
+    elif [ "$count" -eq 0 ]; then
+      die "no mbox matches '$query'"
+    fi
+  fi
+  live="$(_mbox_live_json)"
+  local rows="" n sid st vnc
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    sid="$(_mbox_id "$n")"
+    st="$(_mbox_state_for "$sid" "$live")"
+    vnc="$(_mbox_vnc_url "$n")"
+    [ -n "$vnc" ] || vnc="-"
+    # NOTE: $(...) strips trailing newlines — append $'\n' outside; feed with printf '%s' (not <<<) or fzf gets a blank line
+    rows+="$(printf '%-16s %-8s %-28s %s	%s' "$n" "$st" "$(_mbox_friendly_url "$n")" "$vnc" "$n")"$'\n'
+  done <<<"$names"
+  printf '%s' "$rows" | MBOX_FZF_HEADER='NAME  STATE  URL  VNC' _mbox_fzf 'mbox> '
+}
+
+_mbox_resolve_id() {
+  local name="$1" sid
+  sid="$(_mbox_id "$name")"
+  [ -n "$sid" ] || die "unknown mbox '$name'"
+  printf '%s' "$sid"
+}
+
+_mbox_register_created() {
+  local created="$1" name zone
+  name="$(jq -r .name <<<"$created")"
+  zone="$(_mbox_dns_zone)"
+  local reg
+  reg="$(jq -n --argjson c "$created" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg zone "$zone" \
+    '$c + {created_at:$now, dns_zone:$zone}')"
+  _mbox_put "$name" "$reg"
+  cmd_proxy >/dev/null 2>&1 || echo "mbox: warning: mbox proxy failed — run: mbox proxy" >&2
+}
+
+_mbox_print_ready() {
+  local name="$1" created="$2"
+  echo
+  echo "✓ mbox '$name' ready"
+  echo "  id   $(jq -r '.devbox_id // .sandbox_id' <<<"$created")"
+  echo "  URL  $(_mbox_friendly_url "$name")"
+  local vnc
+  vnc="$(_mbox_vnc_url "$name")"
+  [ -n "$vnc" ] && echo "  VNC  $vnc"
+  echo "  TTY  mbox console $name"
+  echo "  base mbox base $name --as <base-name>   # bless as project carbon-copy"
+}
+
+# ── parent picker for mbox new: bases | boxes | seeds ───────────────────────
+# prints: kind|ref   (kind = base|box|seed)
+_mbox_pick_parent() {
+  local proj="{}" rows="" live default="" 
+  if _mbox_has_project; then
+    proj="$(_mbox_project_json)"
+    default="$(jq -r '.default_base // empty' <<<"$proj")"
+  fi
+  live="$(_mbox_live_json)"
+
+  # bases
+  if [ "$(jq '.bases|length' <<<"$proj")" != "0" ]; then
+    local b mark snap
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      snap="$(jq -r --arg b "$b" '.bases[$b].snapshot' <<<"$proj")"
+      mark=""
+      [ "$b" = "$default" ] && mark=" (default)"
+      rows+="$(printf 'base  %-20s snap %s%s\tbase|%s' "$b" "${snap:0:24}…" "$mark" "$b")"$'\n'
+    done < <(jq -r '.bases|keys[]' <<<"$proj")
+  fi
+
+  # boxes
+  local n sid st
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    sid="$(_mbox_id "$n")"
+    st="$(_mbox_state_for "$sid" "$live")"
+    rows+="$(printf 'box   %-20s %-8s %s\tbox|%s' "$n" "$st" "$(_mbox_friendly_url "$n")" "$n")"$'\n'
+  done < <(_mbox_names)
+
+  # seeds
+  local tpls
+  tpls="$(_mbox_api list_templates)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rows+="$line"$'\n'
+  done < <(jq -r '
+    (.public + (.catalog // []) + .private)[] |
+    "seed  \(.name|tostring|.[0:20])  \(.access)  \(.hint // "")\tseed|\(.id)"
+  ' <<<"$tpls")
+
+  [ -n "$rows" ] || die "nothing to fork from — run mbox (init) first"
+  printf '%s' "$rows" | MBOX_FZF_HEADER='KIND  NAME  DETAIL' _mbox_fzf 'parent> '
+}
+
+# ── init wizard ─────────────────────────────────────────────────────────────
+cmd_init() {
+  _mbox_ensure
+  local toml main_root
+  main_root="$(_mbox_main_repo_root 2>/dev/null)" || main_root=""
+  [ -n "$main_root" ] || [ -n "$(_mbox_git_toplevel)" ] \
+    || die "init requires a git repo (cd into the project)"
+  toml="$(_mbox_toml_path)" || die "init requires a git repo"
+  if [ -f "$toml" ]; then
+    die "$MBOX_TOML_NAME already exists — mbox new / mbox base"
+  fi
+
+  echo "› no $MBOX_TOML_NAME — create first project base"
+  echo "  DNS zone: $(_mbox_dns_zone)  (from main repo: $(basename "${main_root:-$(_mbox_git_toplevel)}") )"
+  local tpls seed_id base_name box_name
+  tpls="$(_mbox_api list_templates)"
+  local rows=""
+  rows="$(jq -r '
+    (.public + (.catalog // []) + .private)[] |
+    "\(.access)  \(.name)\t\(.id)\t\(.hint // "")\t\(.id)"
+  ' <<<"$tpls" | awk -F'\t' '{printf "%-10s %-36s %s\t%s\n", $1, $2, $3, $4}')"
+  seed_id="$(MBOX_FZF_HEADER='ACCESS  TEMPLATE  HINT' _mbox_fzf 'seed> ' <<<"$rows")" \
+    || die "cancelled"
+  echo "  seed: $seed_id"
+
+  local default_base
+  default_base="$(_mbox_dns_apex)"
+  if [ -t 0 ]; then
+    read -r -p "  base name [$default_base]: " base_name || true
+  fi
+  base_name="${base_name:-$default_base}"
+  [[ "$base_name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "bad base name: $base_name"
+  box_name="$base_name"
+  if [ -n "$(_mbox_id "$box_name")" ]; then
+    die "mbox '$box_name' already exists in registry — pick another base name"
+  fi
+
+  _mbox_api project init "$toml" >/dev/null
+  local created snap
+  echo "› creating box '$box_name' from seed '$seed_id'…"
+  created="$(_mbox_api create "$box_name" --template "$seed_id" \
+    --timeout "$MBOX_TIMEOUT" --port "$MBOX_APP_PORT")"
+  _mbox_register_created "$created"
+  echo "› snapshotting as base '$base_name'…"
+  snap="$(_mbox_api snapshot "$(jq -r '.devbox_id // .sandbox_id' <<<"$created")" --name "$base_name")"
+  _mbox_api project set-base "$toml" "$base_name" "$(jq -r .snapshot_id <<<"$snap")" \
+    --source-box "$box_name" --seed "$seed_id" --default >/dev/null
+
+  _mbox_print_ready "$box_name" "$created"
+  echo
+  echo "  project: $toml"
+  echo "  default base: $base_name"
+  echo "  customize this box, then:  mbox base $box_name --as $base_name"
+  echo "  fork:                      mbox new <leaf-name>"
+}
+
+# ── new ─────────────────────────────────────────────────────────────────────
+cmd_new() {
+  _mbox_ensure
+  local name="${1:-}" from="" timeout="$MBOX_TIMEOUT" port="$MBOX_APP_PORT"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      *) die "usage: mbox new <name> [--from base:NAME|box:NAME|seed:ID]" ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: mbox new <name>"
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "name must be lowercase kebab"
+  [ -z "$(_mbox_id "$name")" ] || die "mbox '$name' already exists"
+
+  if ! _mbox_has_project; then
+    echo "mbox: no $MBOX_TOML_NAME — running init first" >&2
+    cmd_init
+    _mbox_has_project || die "init did not create project config"
+  fi
+
+  # inherit timeout/port from project if set
+  local proj
+  proj="$(_mbox_project_json)"
+  port="$(jq -r --argjson p "$port" '.app_port // $p' <<<"$proj")"
+  timeout="$(jq -r --argjson t "$timeout" '.timeout // $t' <<<"$proj")"
+
+  local parent kind ref
+  if [ -n "$from" ]; then
+    parent="$from"
+  else
+    parent="$(_mbox_pick_parent)" || die "cancelled"
+  fi
+  kind="${parent%%|*}"
+  ref="${parent#*|}"
+  # allow base:x / box:x / seed:x from --from
+  if [[ "$parent" == *:* && "$parent" != *\|* ]]; then
+    kind="${parent%%:*}"
+    ref="${parent#*:}"
+  fi
+
+  local created
+  case "$kind" in
+    base)
+      local snap
+      snap="$(jq -r --arg b "$ref" '.bases[$b].snapshot // empty' <<<"$proj")"
+      [ -n "$snap" ] || die "unknown base '$ref'"
+      echo "› creating '$name' from base '$ref'…"
+      created="$(_mbox_api create "$name" --snapshot "$snap" --timeout "$timeout" \
+        --port "$port")"
+      ;;
+    box)
+      local sid
+      sid="$(_mbox_resolve_id "$ref")"
+      echo "› branching leaf '$ref' → fork '$name'…"
+      created="$(_mbox_api fork "$sid" "$name" --port "$port")"
+      ;;
+    seed)
+      echo "› creating '$name' from seed '$ref' (new lineage)…"
+      created="$(_mbox_api create "$name" --template "$ref" --timeout "$timeout" \
+        --port "$port")"
+      ;;
+    *) die "bad parent kind: $kind" ;;
+  esac
+
+  _mbox_register_created "$created"
+  _mbox_print_ready "$name" "$created"
+  echo "  from $kind:$ref"
+}
+
+# ── base / default ──────────────────────────────────────────────────────────
+cmd_base() {
+  _mbox_ensure
+  _mbox_has_project || die "no $MBOX_TOML_NAME — run: mbox"
+  local toml box_name as_name="" make_default=0
+  toml="$(_mbox_toml_path)"
+  box_name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) as_name="$2"; shift 2 ;;
+      --default) make_default=1; shift ;;
+      -*) die "usage: mbox base [box] [--as base-name] [--default]" ;;
+      *)
+        [ -z "$box_name" ] || die "usage: mbox base [box] [--as base-name] [--default]"
+        box_name="$1"
+        shift
+        ;;
+    esac
+  done
+  box_name="${box_name:-$(_mbox_pick_box)}" || exit 1
+  if [ -z "$as_name" ]; then
+    if [ -t 0 ]; then
+      read -r -p "  save as base name [$box_name]: " as_name || true
+    fi
+    as_name="${as_name:-$box_name}"
+  fi
+  [[ "$as_name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "bad base name: $as_name"
+
+  local sid snap extra=()
+  sid="$(_mbox_resolve_id "$box_name")"
+  echo "› blessing '$box_name' → base '$as_name'…"
+  snap="$(_mbox_api snapshot "$sid" --name "$as_name")"
+  (( make_default )) && extra+=(--default)
+  _mbox_api project set-base "$toml" "$as_name" "$(jq -r .snapshot_id <<<"$snap")" \
+    --source-box "$box_name" "${extra[@]}" >/dev/null
+  echo "✓ base '$as_name' ← snapshot $(jq -r .snapshot_id <<<"$snap")"
+  if (( make_default )); then
+    echo "  default_base set to '$as_name'"
+  else
+    echo "  (default unchanged — pass --default to flip)"
+  fi
+  echo "  mbox new <leaf>  # pick this base in the parent fzf"
+}
+
+cmd_default() {
+  _mbox_ensure
+  _mbox_has_project || die "no $MBOX_TOML_NAME"
+  local toml name="${1:-}"
+  toml="$(_mbox_toml_path)"
+  if [ -z "$name" ]; then
+    local proj rows b
+    proj="$(_mbox_project_json)"
+    rows=""
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      rows+="$(printf '%s\t%s' "$b" "$b")"$'\n'
+    done < <(jq -r '.bases|keys[]' <<<"$proj")
+    [ -n "$rows" ] || die "no bases yet — mbox base <box>"
+    name="$(printf '%s' "$rows" | MBOX_FZF_HEADER='BASE' _mbox_fzf 'default> ')" || exit 1
+  fi
+  _mbox_api project set-default "$toml" "$name" >/dev/null
+  echo "✓ default_base = $name"
+}
+
+# ── proxy / lifecycle (unchanged spirit) ────────────────────────────────────
+cmd_proxy() {
+  _mbox_ensure
+  _mbox_dns_context
+  need caddy
+  local name sid port host upstream routes="" hosts_block caddy_block tmp
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    sid="$(_mbox_id "$name")"
+    [ -n "$sid" ] || continue
+    port="$(_mbox_get "$name" app_port)"
+    port="${port:-$MBOX_APP_PORT}"
+    host="$(_mbox_friendly_host "$name")"
+    upstream="$(_mbox_upstream_app "$name")"
+    routes+="${host}"$'\t'"${upstream}"$'\n'
+    if _mbox_is_desktop "$name"; then
+      routes+="$(_mbox_vnc_friendly_host "$name")"$'\t'"$(_mbox_upstream_vnc "$name")"$'\n'
+    fi
+  done < <(_mbox_names)
+
+  hosts_block="$(printf '%s' "$routes" | awk -F'\t' 'NF{print "127.0.0.1 "$1}' | sort -u)"
+  caddy_block="$(printf '%s' "$routes" | awk -F'\t' 'NF{
+    host=$1; up=$2; uh=up; sub(/^https?:\/\//,"",uh);
+    printf "%s {\n\ttls internal\n\treverse_proxy %s {\n\t\theader_up Host %s\n\t}\n}\n", host, up, uh
+  }')"
+
+  tmp="$(mktemp)"
+  awk '/^# BEGIN mbox-proxy/{f=1} !f{print} /^# END mbox-proxy/{f=0}' /etc/hosts >"$tmp"
+  {
+    echo "# BEGIN mbox-proxy (managed by mbox proxy)"
+    printf '%s\n' "$hosts_block"
+    echo "# END mbox-proxy"
+  } >>"$tmp"
+  sudo cp "$tmp" /etc/hosts && trash -f "$tmp"
+
+  if [ -z "$caddy_block" ]; then
+    printf '# mbox routes — none\n' | sudo tee "$MBOX_CADDY_ROUTES" >/dev/null
+  else
+    printf '%s' "$caddy_block" | sudo tee "$MBOX_CADDY_ROUTES" >/dev/null
+  fi
+  _cora_caddy_reload || die "caddy reload failed (run: sudo caddy validate --config /etc/caddy/Caddyfile)"
+
+  echo "Routes:"
+  if [ -z "$routes" ]; then
+    echo "  (none)"
+  else
+    printf '%s' "$routes" | awk -F'\t' 'NF{printf "  https://%s -> %s\n", $1, $2}'
+  fi
+}
+
+cmd_ls() {
+  _mbox_ensure
+  _mbox_dns_context
+  local name sid port state url up live proj
+  live="$(_mbox_live_json)"
+  printf 'NAME\tSTATE\tURL\tUPSTREAM\n'
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    sid="$(_mbox_id "$name")"
+    port="$(_mbox_get "$name" app_port)"
+    port="${port:-$MBOX_APP_PORT}"
+    state="$(_mbox_state_for "$sid" "$live")"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$state" "$(_mbox_friendly_url "$name")" \
+      "$(_mbox_upstream_app "$name")"
+  done < <(_mbox_names) | column -t -s $'\t'
+
+  if _mbox_has_project; then
+    proj="$(_mbox_project_json)"
+    echo
+    echo "Bases ($(_mbox_toml_path)):"
+    if [ "$(jq '.bases|length' <<<"$proj")" = "0" ]; then
+      echo "  (none — mbox base <box>)"
+    else
+      jq -r --arg d "$(jq -r '.default_base // empty' <<<"$proj")" '
+        .bases|to_entries[] |
+        "  \(if .key==$d then "*" else " " end) \(.key)  \(.value.snapshot[0:40])…  src=\(.value.source_box // "-")"
+      ' <<<"$proj"
+    fi
+  else
+    echo
+    echo "  no $MBOX_TOML_NAME — run: mbox"
+  fi
+}
+
+
+# Keepalive: Morph TTL is a hard countdown — VNC/console traffic does NOT extend it.
+# Something on the HOST must call set_timeout (API key lives here).
+# Console ⇒ beat set_timeout only on recent PTY stdin/stdout (not mere attach).
+# Desktop/VNC ⇒ auto background keeper on wake/open (hybrid activity):
+#   connected :6080/:5900 AND X11 idle < MBOX_KEEPALIVE_IDLE
+# Explicit `mbox keep` is optional foreground debug / status — not required day-to-day.
+MBOX_KEEP_DIR="${MBOX_KEEP_DIR:-$MBOX_DIR/keep}"
+
+_mbox_keepalive_interval() {
+  # Must stay well under TTL so we beat before endAt. Floor 15s.
+  local t="${1:-$MBOX_TIMEOUT}"
+  local i=$(( t / 3 ))
+  if [ "$i" -lt 15 ]; then i=15; fi
+  if [ "$i" -gt 300 ]; then i=300; fi
+  # never >= TTL (would race the hard deadline)
+  if [ "$i" -ge "$t" ] && [ "$t" -gt 15 ]; then i=$(( t / 2 )); fi
+  if [ "$i" -lt 15 ]; then i=15; fi
+  printf '%s' "$i"
+}
+
+_mbox_project_timeout() {
+  local t="$MBOX_TIMEOUT"
+  if _mbox_has_project 2>/dev/null; then
+    local proj
+    proj="$(_mbox_api project get "$(_mbox_toml_path)" 2>/dev/null)" || proj=""
+    if [ -n "$proj" ]; then
+      t="$(jq -r --argjson t "$t" '.timeout // $t' <<<"$proj")"
+    fi
+  fi
+  printf '%s' "$t"
+}
+
+_mbox_keep_pidfile() { printf '%s/%s.pid' "$MBOX_KEEP_DIR" "$1"; }
+_mbox_keep_logfile() { printf '%s/%s.log' "$MBOX_KEEP_DIR" "$1"; }
+
+_mbox_keep_running() {
+  local name="$1" pf pid
+  pf="$(_mbox_keep_pidfile "$name")"
+  [ -f "$pf" ] || return 1
+  pid="$(cat "$pf" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # confirm it's our worker
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "__keep_worker $name" || return 1
+  return 0
+}
+
+_mbox_keep_stop() {
+  local name="$1" pf pid
+  pf="$(_mbox_keep_pidfile "$name")"
+  if [ -f "$pf" ]; then
+    pid="$(cat "$pf" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      # orphans: kill matching workers by name
+      sleep 0.2
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$pf"
+  fi
+  # belt-and-suspenders: any leftover workers for this name
+  pkill -f "__keep_worker $name( |$)" 2>/dev/null || true
+}
+
+_mbox_keep_loop() {
+  local name="$1" sid
+  sid="$(_mbox_resolve_id "$name")"
+  echo "› keep $name ($sid)"
+  echo "  Morph devboxes auto-pause on idle — no E2B-style TTL worker needed."
+  echo "  Use mbox pause / mbox wake explicitly if you want control."
+  return 0
+}
+
+_mbox_keep_start() {
+  local name="$1" pf lf self
+  mkdir -p "$MBOX_KEEP_DIR"
+  if _mbox_keep_running "$name"; then
+    echo "› keep already running for $name (pid $(cat "$(_mbox_keep_pidfile "$name")"))"
+    return 0
+  fi
+  _mbox_keep_stop "$name" >/dev/null 2>&1 || true
+  pf="$(_mbox_keep_pidfile "$name")"
+  lf="$(_mbox_keep_logfile "$name")"
+  self="$(readlink -f "${BASH_SOURCE[0]:-$HOME/.local/scripts/mbox}")"
+  (
+    exec -a "__keep_worker $name" bash -c '
+      set -euo pipefail
+      # shellcheck disable=SC1090
+      source "$1"
+      _mbox_keep_loop "$2"
+    ' bash "$self" "$name"
+  ) >>"$lf" 2>&1 &
+  echo $! >"$pf"
+  disown $! 2>/dev/null || true
+  echo "› keep started for $name (pid $(cat "$pf")) → $lf"
+}
+
+cmd_keep() {
+  _mbox_ensure
+  local name mode="status"
+  # usage: mbox keep [name] [--start|--stop|--fg|--status]
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --start) mode=start; shift ;;
+      --stop) mode=stop; shift ;;
+      --fg) mode=fg; shift ;;
+      --status) mode=status; shift ;;
+      -*) die "usage: mbox keep [name] [--start|--stop|--fg|--status]" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  name="$(_mbox_pick_box "${name:-}")" || exit 1
+  case "$mode" in
+    start) _mbox_keep_start "$name" ;;
+    stop) _mbox_keep_stop "$name"; echo "✓ keep stopped $name" ;;
+    fg) _mbox_keep_stop "$name" >/dev/null 2>&1 || true; _mbox_keep_loop "$name" ;;
+    status)
+      if _mbox_keep_running "$name"; then
+        echo "keep $name running pid=$(cat "$(_mbox_keep_pidfile "$name")") log=$(_mbox_keep_logfile "$name")"
+      else
+        echo "keep $name not running"
+      fi
+      ;;
+  esac
+}
+
+cmd_activity() {
+  _mbox_ensure
+  local name sid idle
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  sid="$(_mbox_resolve_id "$name")"
+  idle="${MBOX_KEEPALIVE_IDLE}"
+  _mbox_api activity "$sid" --idle-secs "$idle"
+}
+
+cmd_console() {
+  _mbox_ensure
+  local name sid timeout interval idle
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  sid="$(_mbox_resolve_id "$name")"
+  timeout="$(_mbox_project_timeout)"
+  interval="$(_mbox_keepalive_interval "$timeout")"
+  idle="${MBOX_KEEPALIVE_IDLE}"
+  echo "› mbox $name ($sid)  keepalive ${timeout}s every ${interval}s (PTY I/O idle<${idle}s)"
+  echo "  beats TTL only on recent console stdin/stdout — idle prompt / coffee → sleep"
+  # PTY wrapper watches real traffic (stdin OR stdout). Attached≠active.
+  # Quiet agent gaps under idle threshold still count as active.
+  _mbox_api console_session "$sid" --timeout "$timeout" --idle-secs "$idle" --interval "$interval"
+}
+
+cmd_url() {
+  _mbox_ensure
+  local name
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  if [ "${2:-}" = "--upstream" ]; then
+    _mbox_upstream_app "$name"
+    echo
+    return 0
+  fi
+  _mbox_friendly_url "$name"
+  echo
+}
+
+cmd_open() {
+  local name url vnc
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  # Opening the box implies interest — wake web/desktop and start VNC keep if desktop.
+  cmd_wake "$name" >/dev/null 2>&1 || true
+  url="$(_mbox_friendly_url "$name")"
+  vnc="$(_mbox_vnc_url "$name")"
+  if command -v xdg-open >/dev/null 2>&1; then
+    if [ -n "$vnc" ]; then
+      xdg-open "$vnc" >/dev/null 2>&1 &
+    else
+      xdg-open "$url" >/dev/null 2>&1 &
+    fi
+  else
+    echo "$url"
+    [ -n "$vnc" ] && echo "$vnc"
+  fi
+}
+
+cmd_pause() {
+  _mbox_ensure
+  local name sid
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  sid="$(_mbox_resolve_id "$name")"
+  _mbox_keep_stop "$name" >/dev/null 2>&1 || true
+  "$MBOX_MORPHCLI" devbox pause "$sid"
+  echo "✓ paused $name"
+}
+
+cmd_wake() {
+  _mbox_ensure
+  local name sid vnc
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  sid="$(_mbox_resolve_id "$name")"
+  # Do not bind a placeholder http.server on app_port — that steals 8080 from Vite/Cora.
+  _mbox_api resume "$sid" >/dev/null 2>&1 || true
+  _mbox_ensure_desktop "$name" || true
+  if _mbox_is_desktop "$name"; then
+    _mbox_keep_start "$name" || true
+  fi
+  echo "✓ awake $name  $(_mbox_friendly_url "$name")"
+  vnc="$(_mbox_vnc_url "$name")"
+  [ -n "$vnc" ] && echo "  VNC  $vnc"
+}
+
+cmd_id() {
+  _mbox_ensure
+  local name
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  _mbox_resolve_id "$name"
+  echo
+}
+
+cmd_rm() {
+  _mbox_ensure
+  local name sid
+  name="$(_mbox_pick_box "${1:-}")" || exit 1
+  sid="$(_mbox_resolve_id "$name")"
+  echo "› killing '$name' ($sid) forever…"
+  _mbox_keep_stop "$name" >/dev/null 2>&1 || true
+  "$MBOX_MORPHCLI" devbox delete "$sid" 2>/dev/null || true
+  _mbox_del "$name"
+  cmd_proxy >/dev/null 2>&1 || true
+  echo "✓ destroyed $name — not recoverable"
+}
+
+cmd_go() {
+  _mbox_ensure
+  if ! _mbox_has_project; then
+    cmd_init
+    return
+  fi
+  if [ -z "$(_mbox_names)" ]; then
+    echo "mbox: project configured but no boxes — try: mbox new <name>"
+    return 0
+  fi
+  cmd_console "${1:-}"
+}
+
+cmd_trust() {
+  # Chrome/Chromium on Linux use NSS (~/.pki/nssdb), not only the system store.
+  # Caddy's `caddy trust` often only hits the system store → Chrome still screams.
+  _mbox_ensure
+  need certutil
+  local ca_src="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+  local ca_tmp
+  ca_tmp="$(mktemp --suffix=.crt)"
+  sudo test -r "$ca_src" || die "Caddy local CA not found at $ca_src (is caddy installed?)"
+  sudo cp "$ca_src" "$ca_tmp"
+  sudo chmod 644 "$ca_tmp"
+  mkdir -p "$HOME/.pki/nssdb"
+  if [ ! -f "$HOME/.pki/nssdb/cert9.db" ]; then
+    certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password
+  fi
+  certutil -d sql:"$HOME/.pki/nssdb" -D -n "Caddy Local Authority" 2>/dev/null || true
+  certutil -d sql:"$HOME/.pki/nssdb" -A -t "C,," -n "Caddy Local Authority" -i "$ca_tmp"
+  trash -f "$ca_tmp" 2>/dev/null || rm -f "$ca_tmp"
+  # Best-effort system store too
+  sudo caddy trust 2>/dev/null || true
+  echo "✓ Caddy local CA installed into NSS ($HOME/.pki/nssdb)"
+  echo "  Fully quit Chrome/Chromium (all windows) and reopen, then try https://<box>.<repo>.test"
+}
+
+cmd_help() {
+  cat <<EOF
+mbox — Morph Cloud devboxes (chad-style carbon copies)
+
+  mbox                     no .mbox.toml → init wizard; else fzf → console
+  mbox new <name>          fzf parent (bases | boxes | seeds) → create
+  mbox base [box] [--as B] [--default]  bless box snapshot as named project base
+  mbox default [base]      set default_base highlight
+  mbox ls | list
+  mbox console | go [name]
+  mbox url | open | proxy | pause | wake | id
+  mbox activity [name]     (stub — Morph handles idle pause)
+  mbox keep [name]         (info — Morph auto-pauses; no TTL worker)
+  mbox trust               install Caddy CA into Chrome NSS trust store
+  mbox rm [name]           delete forever
+  mbox help
+
+.parent fzf on \`mbox new\`:
+  bases     blessed snapshots from .mbox.toml
+  boxes     live/paused leaves (branch fork)
+  seeds     approved seeds (base/desktop), morph.new catalog, your tpl_*
+
+Lifecycle: Morph auto-pauses idle devboxes. mbox rm = permanent delete.
+DNS: https://<box>.<repo>.test via \`mbox proxy\` (Caddy + /etc/hosts).
+     Desktop: Morph web UI or proxied noVNC when exposed.
+Auth: MORPH_API_KEY or ~/.config/mbox/config.json or morphcloud profile
+      keys: https://cloud.morph.so/web/keys
+Config: $MBOX_TOML_NAME at git root · registry: $MBOX_REGISTRY
+EOF
+}
+
+main() {
+  local arg="${1:-go}"
+  case "$arg" in
+    go) shift || true; cmd_go "${1:-}" ;;
+    init) cmd_init ;;
+    new) shift; cmd_new "$@" ;;
+    base) shift; cmd_base "$@" ;;
+    default) shift; cmd_default "$@" ;;
+    ls|list) cmd_ls ;;
+    console|c|ssh) shift; cmd_console "$@" ;;
+    url) shift; cmd_url "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    proxy) cmd_proxy ;;
+    trust) cmd_trust ;;
+    pause|ps) shift; cmd_pause "$@" ;;
+    wake|resume|rs) shift; cmd_wake "$@" ;;
+    activity) shift; cmd_activity "$@" ;;
+    keep) shift; cmd_keep "$@" ;;
+    id) shift; cmd_id "$@" ;;
+    rm|remove|kill|destroy) shift; cmd_rm "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      if ! _mbox_has_project 2>/dev/null; then
+        cmd_init
+      else
+        cmd_console "$arg"
+      fi
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

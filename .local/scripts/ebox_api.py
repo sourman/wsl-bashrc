@@ -251,7 +251,7 @@ def cmd_create(args: list[str]) -> None:
     snapshot = None
     timeout = 60
     port = 8080
-    stub_web = True
+    stub_web = False
     i = 1
     while i < len(args):
         if args[i] == "--template" and i + 1 < len(args):
@@ -373,17 +373,11 @@ def cmd_url(args: list[str]) -> None:
 
 
 def cmd_ensure_web(args: list[str]) -> None:
+    """Publish the app_port URL. Do not bind a placeholder server — that steals Vite."""
     sid = args[0]
     port = int(args[1]) if len(args) > 1 else 8080
     Sandbox = _Sandbox()
     sbx = Sandbox.connect(sid, timeout=60)
-    sbx.commands.run(
-        f"bash -lc 'ss -lntp 2>/dev/null | grep -q :{port} || "
-        f"(mkdir -p /home/user/ebox-www && "
-        f"python3 -m http.server {port} --directory /home/user/ebox-www)'",
-        background=True,
-        timeout=0,
-    )
     print(f"https://{sbx.get_host(port)}")
 
 

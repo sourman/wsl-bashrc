@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Harden Tailscale persistence on the Redmi (MIUI) over ADB.
+#
+# Layers (best practice for aggressive OEMs like Xiaomi):
+#   1. Always-on VPN (system)
+#   2. Doze whitelist + appops (ADB)
+#   3. Tailscale Watchdog foreground service (APK)
+#   4. MIUI autostart / battery / recents-lock (manual — script opens the screens)
+#
+# Usage:
+#   redmi-harden                 apply everything reachable over ADB
+#   redmi-harden --check         verify current state
+#   redmi-harden --open-miui     only open MIUI permission screens on the phone
+#   redmi-harden --no-watchdog   skip watchdog APK install
+#
+# Requires USB or wireless ADB. Pair with `redmi` for Tailscale ADB.
+
+set -euo pipefail
+
+PHONE_HOST="${REDMI_HOST:-redmi}"
+ADB_PORT="${REDMI_ADB_PORT:-5555}"
+ADB_SERIAL="${REDMI_ADB_SERIAL:-}"
+WATCHDOG_PKG="com.sumer.tailscalewatchdog"
+TAILSCALE_PKG="com.tailscale.ipn"
+WATCHDOG_APK="${REDMI_WATCHDOG_APK:-$HOME/.local/share/apk/tailscale-watchdog.apk}"
+LOCKDOWN="${REDMI_VPN_LOCKDOWN:-0}" # 1 = block all traffic when Tailscale is down
+
+fail() { echo "redmi-harden: $*" >&2; exit 1; }
+note() { echo "redmi-harden: $*" >&2; }
+ok()   { echo "redmi-harden: ✓ $*" >&2; }
+
+MODE=apply
+INSTALL_WATCHDOG=1
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) MODE=check ;;
+    --open-miui) MODE=open-miui ;;
+    --no-watchdog) INSTALL_WATCHDOG=0 ;;
+    -h|--help)
+      sed -n '2,18p' "$0" >&2
+      exit 0
+      ;;
+    *) fail "unknown argument: $arg" ;;
+  esac
+done
+
+command -v adb >/dev/null 2>&1 || fail "adb is not installed or not on PATH"
+
+pick_serial() {
+  if [[ -n "$ADB_SERIAL" ]]; then
+    echo "$ADB_SERIAL"
+    return
+  fi
+
+  local usb serials target ip
+  mapfile -t serials < <(adb devices | awk 'NR>1 && $2=="device" { print $1 }')
+  [[ ${#serials[@]} -gt 0 ]] || fail "no adb device found (plug in USB or run: redmi)"
+
+  for s in "${serials[@]}"; do
+    [[ "$s" == *:* ]] || usb="$s"
+  done
+
+  if [[ -n "${usb:-}" ]]; then
+    echo "$usb"
+    return
+  fi
+
+  if command -v tailscale >/dev/null 2>&1; then
+    ip="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }')"
+    if [[ -n "${ip:-}" ]]; then
+      target="${ip}:${ADB_PORT}"
+      for s in "${serials[@]}"; do
+        [[ "$s" == "$target" ]] && { echo "$s"; return; }
+      done
+    fi
+  fi
+
+  echo "${serials[0]}"
+}
+
+ADB=(adb -s "$(pick_serial)")
+
+adb_shell() { "${ADB[@]}" shell "$@"; }
+
+open_miui_screens() {
+  note "Opening MIUI permission screens on the phone — enable Tailscale + Tailscale Watchdog in each:"
+  note "  • Autostart"
+  note "  • Battery → No restrictions / Unrestricted"
+  note "  • Lock both apps in Recents (swipe down → lock icon)"
+
+  adb_shell am start -n com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity \
+    >/dev/null 2>&1 || true
+  sleep 1
+  adb_shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${TAILSCALE_PKG}" \
+    >/dev/null 2>&1 || true
+  sleep 1
+  adb_shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${WATCHDOG_PKG}" \
+    >/dev/null 2>&1 || true
+  sleep 1
+  adb_shell am start -a android.settings.ACCESSIBILITY_SETTINGS >/dev/null 2>&1 || true
+  sleep 1
+  adb_shell am start -a android.settings.VPN_SETTINGS >/dev/null 2>&1 || true
+}
+
+apply_appops() {
+  local pkg="$1"
+  for op in RUN_IN_BACKGROUND RUN_ANY_IN_BACKGROUND WAKE_LOCK START_FOREGROUND; do
+    adb_shell cmd appops set "$pkg" "$op" allow >/dev/null 2>&1 || true
+  done
+  adb_shell cmd deviceidle whitelist "+${pkg}" >/dev/null 2>&1 || true
+}
+
+apply_network_hygiene() {
+  adb_shell settings put global private_dns_mode off >/dev/null 2>&1 || true
+  ok "private DNS set to off (avoids Tailscale DNS conflicts on network switches)"
+}
+
+apply_always_on_vpn() {
+  adb_shell settings put secure always_on_vpn_app "$TAILSCALE_PKG"
+  adb_shell settings put secure always_on_vpn_lockdown "$LOCKDOWN"
+  if [[ "$LOCKDOWN" == "1" ]]; then
+    ok "always-on VPN enabled with lockdown (no traffic without Tailscale)"
+  else
+    ok "always-on VPN enabled (lockdown off — phone keeps mobile data if Tailscale stalls)"
+  fi
+}
+
+install_watchdog() {
+  [[ -f "$WATCHDOG_APK" ]] || fail "watchdog APK not found at $WATCHDOG_APK"
+
+  local install_out rc=0
+  install_out="$("${ADB[@]}" install -r "$WATCHDOG_APK" 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]] && [[ "$install_out" == *Success* ]]; then
+    ok "installed Tailscale Watchdog"
+    apply_appops "$WATCHDOG_PKG"
+    return 0
+  fi
+
+  note "watchdog APK install blocked by MIUI: ${install_out##*$'\n'}"
+  note "pushing APK to phone Downloads for manual install ..."
+  "${ADB[@]}" push "$WATCHDOG_APK" /sdcard/Download/tailscale-watchdog.apk >/dev/null
+  adb_shell am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS >/dev/null 2>&1 || true
+  cat >&2 <<'EOF'
+redmi-harden: enable “Install via USB” on the phone, then rerun:
+  redmi-harden
+
+MIUI path: Settings → Additional settings → Developer options → Install via USB ON
+(needs a Xiaomi account on some builds). APK is at Download/tailscale-watchdog.apk
+if you prefer tapping to install.
+EOF
+  return 1
+}
+
+start_watchdog() {
+  adb_shell am start-foreground-service -n "${WATCHDOG_PKG}/.WatchdogService" >/dev/null 2>&1 \
+    || adb_shell am startservice -n "${WATCHDOG_PKG}/.WatchdogService" >/dev/null 2>&1 \
+    || true
+  ok "started Watchdog foreground service"
+}
+
+wake_tailscale() {
+  adb_shell am broadcast -a com.tailscale.ipn.CONNECT_VPN -n "${TAILSCALE_PKG}/.IPNReceiver" >/dev/null 2>&1 || true
+}
+
+check_state() {
+  local vpn_app vpn_lock ts_ver wd_installed
+  vpn_app="$(adb_shell settings get secure always_on_vpn_app | tr -d '\r')"
+  vpn_lock="$(adb_shell settings get secure always_on_vpn_lockdown | tr -d '\r')"
+  ts_ver="$(adb_shell dumpsys package "$TAILSCALE_PKG" | awk -F= '/versionName=/{print $2; exit}' | tr -d '\r')"
+  wd_installed="$("${ADB[@]}" shell pm path "$WATCHDOG_PKG" 2>/dev/null | tr -d '\r' || true)"
+
+  echo "Tailscale:        ${ts_ver:-not installed}"
+  echo "Always-on VPN:    ${vpn_app:-unset} (lockdown=${vpn_lock:-unset})"
+  echo "Private DNS:      $(adb_shell settings get global private_dns_mode | tr -d '\r')"
+  echo "Watchdog APK:     ${wd_installed:-not installed}"
+  echo "Doze whitelist:   $(adb_shell dumpsys deviceidle whitelist | tr -d '\r' | grep -o 'com\.tailscale\.ipn\|com\.sumer\.tailscalewatchdog' | tr '\n' ' ' || true)"
+}
+
+case "$MODE" in
+  open-miui)
+    open_miui_screens
+    exit 0
+    ;;
+  check)
+    check_state
+    exit 0
+    ;;
+esac
+
+note "using adb serial: $("${ADB[@]}" get-serialno 2>/dev/null | tr -d '\r')"
+
+apply_network_hygiene
+apply_always_on_vpn
+apply_appops "$TAILSCALE_PKG"
+wake_tailscale
+
+if [[ "$INSTALL_WATCHDOG" == "1" ]]; then
+  if install_watchdog; then
+    start_watchdog
+  fi
+fi
+
+open_miui_screens
+check_state
+
+cat >&2 <<'EOF'
+
+redmi-harden: ADB steps done. Finish on the phone (one-time, ~2 min):
+
+  1. Autostart screen  → enable Tailscale AND Tailscale Watchdog
+  2. App info screens  → Battery → No restrictions for both apps
+  3. Accessibility     → enable “Tailscale Watchdog” (taps Connect if intents fail)
+  4. VPN settings      → confirm Always-on VPN is on for Tailscale
+  5. Recents           → lock Tailscale + Watchdog cards (swipe down → lock)
+
+Reboot once to verify: Tailscale should connect after unlock; Watchdog restarts on boot.
+
+Note: without root, the phone cannot reboot itself from a watchdog. Escalation is
+CONNECT_VPN intent → launch Tailscale → accessibility tap. That is the standard
+stack for MIUI/ColorOS (see tailscale-watchdog-android).
+
+EOF

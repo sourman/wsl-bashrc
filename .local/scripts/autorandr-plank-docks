@@ -8,6 +8,10 @@
 #   dock2 = `plank -n dock2`  pinned to the external (DP-2), only when docked
 #
 # What this script does:
+#   • autorandr profile — when an external output is active but autorandr is still
+#     on "default" (or vice versa), re-apply the matching profile. XFCE hotplug
+#     can enable DP-2 without autorandr switching, which breaks CRTC page-flips
+#     (black external, working cursor/input).
 #   • dock2 — launched when an external output is connected, killed when not, so
 #     the two docks never overlap on the laptop when undocked.
 #   • dock1 — kept alive ONLY while eDP-1 is actually active. When eDP-1 is
@@ -54,13 +58,41 @@ command -v plank  >/dev/null || exit 0
 DOCK2_NAME=dock2
 EXTERNAL_PRIORITY=(DP-2 DP-1 HDMI-2 HDMI-1)   # laptop panel eDP-1 deliberately excluded
 
-# --- is an external output connected right now? ---
+# Parse the RandR *cache* once. `xrandr --query` (the default) re-probes EDID/DDC
+# on every connector and blocks the X server for ~1s each — from an 8s watchdog
+# that freezes the whole desktop. `--current` is the last known layout, no I2C.
+RANDR="$(xrandr --current)"
+
+# --- is an external output connected AND driving a mode right now? ---
+# "connected" alone is not enough — we need active geometry (WxH+X+Y) to decide
+# the docked profile. XFCE hotplug can light DP-2 without autorandr switching to
+# docked; that leaves CRTC 1 in a broken page-flip state (black external, working
+# cursor/input). autorandr.service is masked, so this watchdog re-applies the
+# matching profile when reality and autorandr diverge.
 connected_ext=""
 for o in "${EXTERNAL_PRIORITY[@]}"; do
-  if xrandr --query | awk -v o="$o" '$1==o && $2=="connected" {f=1} END{exit !f}'; then
+  if printf '%s\n' "$RANDR" | awk -v o="$o" \
+      '$1==o && $2=="connected" {for(i=3;i<=NF;i++) if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) f=1} END{exit !f}'; then
     connected_ext="$o"; break
   fi
 done
+
+if [ "$LOGIN_ONLY" = 0 ] && command -v autorandr >/dev/null; then
+  want_profile=default
+  [ -n "$connected_ext" ] && want_profile=docked
+  have_profile="$(autorandr --current 2>/dev/null || true)"
+  if [ -n "$have_profile" ] && [ "$have_profile" != "$want_profile" ]; then
+    autorandr --change "$want_profile" >/dev/null 2>&1 || true
+    RANDR="$(xrandr --current)"
+    connected_ext=""
+    for o in "${EXTERNAL_PRIORITY[@]}"; do
+      if printf '%s\n' "$RANDR" | awk -v o="$o" \
+          '$1==o && $2=="connected" {for(i=3;i<=NF;i++) if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) f=1} END{exit !f}'; then
+        connected_ext="$o"; break
+      fi
+    done
+  fi
+fi
 
 # --- enumerate plank PIDs by instance via /proc/<pid>/cmdline.
 #   pgrep -x plank matches BOTH instances (same comm); the dock2 token in the
@@ -105,7 +137,7 @@ dock1_needs_reposition() {
   fi
   command -v xdotool >/dev/null || return 1
   local geom mw mh mx my mbottom mright w X Y WIDTH HEIGHT seated=0
-  geom="$(xrandr --query 2>/dev/null | awk -v m=eDP-1 '$1==m && $2=="connected"{for(i=3;i<=NF;i++)if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/){print $i;exit}}')"
+  geom="$(printf '%s\n' "${RANDR:-$(xrandr --current)}" | awk -v m=eDP-1 '$1==m && $2=="connected"{for(i=3;i<=NF;i++)if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/){print $i;exit}}')"
   [ -n "$geom" ] || return 1
   IFS=x+ read -r mw mh mx my <<< "$geom"
   mbottom=$((my+mh)); mright=$((mx+mw))
@@ -128,12 +160,10 @@ fi
 
 # --- dock1: alive only while eDP-1 is active; killed otherwise (no stacking) ---
 #   "active", not "connected": a disabled laptop panel stays "connected" in
-#   xrandr but has no CRTC and reports no geometry, so the connected test below
-#   is true while the screen is dark. listactivemonitors reflects the actual
-#   live CRTC set, which is what we need.
+#   xrandr but has no CRTC geometry (no WxH+X+Y), so we key off geometry.
 if [ "$LOGIN_ONLY" = 0 ]; then
   d1="$(pids_without_token "$DOCK2_NAME")"
-  if xrandr --listactivemonitors 2>/dev/null | grep -qw eDP-1; then
+  if printf '%s\n' "$RANDR" | awk '$1=="eDP-1" && $2=="connected" {for(i=3;i<=NF;i++) if($i~/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) f=1} END{exit !f}'; then
     if [ -z "$d1" ] || dock1_needs_reposition "$d1"; then
       [ -n "$d1" ] && kill -- $d1 2>/dev/null || true
       sleep 1   # let the old window close before relaunch, else it can inherit stale geometry

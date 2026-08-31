@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# One-shot reconnect for Logitech Pebble M350s (BLE HID, rotating address).
+set -euo pipefail
+
+NAME='Pebble M350s'
+PREFIX='D6:74:42:A3'
+SCAN_SECS=12
+GENERIC_UUID='00000000-0000-0000-0000-000000000000'
+
+strip_ansi() { sed -E 's/\x1b\[[0-9;]*m//g'; }
+
+pebble_addrs() {
+  bluetoothctl devices 2>/dev/null | strip_ansi \
+    | grep -i "$NAME" | grep -oiE '([0-9A-F]{2}:){5}[0-9A-F]{2}' | sort -u
+}
+
+connected_addr() {
+  local addr
+  for addr in $(pebble_addrs); do
+    if bluetoothctl info "$addr" 2>/dev/null | grep -qi 'Connected: yes'; then
+      echo "$addr"
+      return 0
+    fi
+  done
+  return 1
+}
+
+try_connect_known() {
+  local addr
+  for addr in $(pebble_addrs); do
+    bluetoothctl trust "$addr" >/dev/null 2>&1 || true
+    bluetoothctl --timeout 10 connect "$addr" >/dev/null 2>&1 || true
+    if bluetoothctl info "$addr" 2>/dev/null | grep -qi 'Connected: yes'; then
+      echo "$addr"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if addr=$(connected_addr); then
+  echo "Pebble already connected ($addr)."
+  exit 0
+fi
+
+if addr=$(try_connect_known); then
+  echo "Connected to bonded Pebble at $addr."
+  exit 0
+fi
+
+scan_file=$(mktemp)
+trap 'rm -f "$scan_file"' EXIT
+
+echo "Scanning ${SCAN_SECS}s for Pebble (click the mouse or use pairing mode)…"
+timeout "$SCAN_SECS" bluetoothctl scan on >"$scan_file" 2>&1 || true
+
+addr=$(strip_ansi <"$scan_file" | grep -i "$NAME" | grep -oiE '([0-9A-F]{2}:){5}[0-9A-F]{2}' | head -1)
+if [ -z "$addr" ]; then
+  addr=$(strip_ansi <"$scan_file" | grep -oiE "${PREFIX}:[0-9A-F]{2}:[0-9A-F]{2}" | head -1)
+fi
+
+if [ -z "$addr" ]; then
+  echo "No Pebble found. Click the mouse or hold the bottom button ~3s (fast-blink pairing mode), then rerun."
+  exit 1
+fi
+
+echo "Found Pebble at $addr — trusting and connecting…"
+bluetoothctl info "$addr" 2>/dev/null | grep -qi 'Paired: yes' \
+  || bluetoothctl --timeout 25 pair "$addr" >/dev/null 2>&1 || true
+bluetoothctl trust "$addr" >/dev/null 2>&1
+bluetoothctl --timeout 12 connect "$addr" >/dev/null 2>&1
+
+if bluetoothctl info "$addr" 2>/dev/null | grep -qi 'Connected: yes'; then
+  echo "Connected to Pebble at $addr."
+  gsettings set org.blueman.plugins.autoconnect services \
+    "[('${addr}', '${GENERIC_UUID}'), ('D6:74:42:A3:CD:BA', '${GENERIC_UUID}')]" 2>/dev/null || true
+  exit 0
+fi
+
+echo "Could not connect. Try pairing mode and rerun: pebble-connect"
+exit 1

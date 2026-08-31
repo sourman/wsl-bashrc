@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Persistent wireless ADB on port 5555 after every reboot (no root).
+#
+# Almost everything is over Tailscale — pairing UI, daily redmi/scrcpy, post-reboot
+# auto-enable. USB is only a fallback for installing the APK if you can't sideload
+# on the phone itself.
+#
+# Usage:
+#   redmi-adb-setup              setup (USB if available, else Tailscale-only guide)
+#   redmi-adb-setup --tailscale  Tailscale-only instructions (no USB)
+#   redmi-adb-setup --pair       pairing URL for the web UI
+#   redmi-adb-setup --check      verify install and port 5555
+
+set -euo pipefail
+
+PHONE_HOST="${REDMI_HOST:-redmi}"
+ADB_PORT="${REDMI_ADB_PORT:-5555}"
+ADB_AUTO_PKG="com.tpn.adbautoenable"
+APK="${REDMI_ADB_AUTO_APK:-$HOME/.local/share/apk/adb-auto-enable.apk}"
+APK_URL="https://github.com/mouldybread/adb-auto-enable/releases/download/v0.3.4/ADB-auto-enable-0.3.4.apk"
+
+fail() { echo "redmi-adb-setup: $*" >&2; exit 1; }
+note() { echo "redmi-adb-setup: $*" >&2; }
+ok()   { echo "redmi-adb-setup: ✓ $*" >&2; }
+
+MODE=setup
+for arg in "$@"; do
+  case "$arg" in
+    --tailscale) MODE=tailscale ;;
+    --pair) MODE=pair ;;
+    --check) MODE=check ;;
+    -h|--help)
+      sed -n '2,16p' "$0" >&2
+      exit 0
+      ;;
+    *) fail "unknown argument: $arg" ;;
+  esac
+done
+
+command -v tailscale >/dev/null 2>&1 || fail "tailscale not found"
+
+resolve_ip() {
+  if [[ -n "${REDMI_IP:-}" ]]; then
+    echo "$REDMI_IP"
+    return
+  fi
+  tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }'
+}
+
+pick_usb() {
+  command -v adb >/dev/null 2>&1 || return 0
+  adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /:/ { print $1; exit }'
+}
+
+pick_tailscale_adb() {
+  command -v adb >/dev/null 2>&1 || return 0
+  local ip="$1"
+  adb devices 2>/dev/null | awk -v t="${ip}:${ADB_PORT}" '$1==t && $2=="device" { print $1; exit }'
+}
+
+port_open() {
+  local ip="$1" port="$2"
+  timeout 2 bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null
+}
+
+ip="$(resolve_ip)"
+[[ -n "$ip" ]] || fail "could not resolve Tailscale IP for $PHONE_HOST"
+
+pair_url="http://${ip}:9093"
+apk_on_phone="/sdcard/Download/adb-auto-enable.apk"
+
+check_state() {
+  local installed="" adb_state=""
+  if command -v adb >/dev/null 2>&1; then
+    if pick_tailscale_adb "$ip" >/dev/null; then
+      installed="$(adb -s "${ip}:${ADB_PORT}" shell pm path "$ADB_AUTO_PKG" 2>/dev/null | head -1 | sed 's/package://' | tr -d '\r' || true)"
+      adb_state="connected"
+    else
+      adb connect "${ip}:${ADB_PORT}" 2>/dev/null | tr -d '\r' || true
+      adb_state="$(adb devices 2>/dev/null | awk -v t="${ip}:${ADB_PORT}" '$1==t {print $2}')"
+      if [[ "$adb_state" == "device" ]]; then
+        installed="$(adb -s "${ip}:${ADB_PORT}" shell pm path "$ADB_AUTO_PKG" 2>/dev/null | head -1 | sed 's/package://' | tr -d '\r' || true)"
+      fi
+    fi
+  fi
+  echo "Tailscale IP:     $ip"
+  echo "Pair web UI:      $pair_url ($(port_open "$ip" 9093 && echo open || echo closed))"
+  echo "ADB auto-enable:  ${installed:-not installed}"
+  echo "Port $ADB_PORT:   $(port_open "$ip" "$ADB_PORT" && echo open || echo closed)"
+  echo "ADB session:      ${adb_state:-not connected}"
+}
+
+print_tailscale_guide() {
+  cat >&2 <<EOF
+redmi-adb-setup: Tailscale-only setup (no USB cable)
+
+Everything after install runs over Tailscale — pairing, port 5555, and redmi/scrcpy.
+
+━━━ Step 1: Install APK on the phone (on the phone, not the PC) ━━━
+
+  Download on the phone (Chrome):
+    $APK_URL
+
+  Or if you have ADB working briefly (USB or Tailscale):
+    the script can push it to Download/adb-auto-enable.apk
+
+  Open the APK → install → open "ADB Auto-Enable" once (starts the web server).
+
+━━━ Step 2: Pair over Tailscale (PC browser) ━━━
+
+  1. Open: $pair_url
+  2. On phone: Developer options → Wireless debugging → Pair with pairing code
+  3. Enter pairing code + port in the web UI → Pair Device
+  4. Click "Switch Target Port Now" in the web UI (enables port $ADB_PORT now)
+
+━━━ Step 3: Verify ━━━
+
+  redmi-adb-setup --check
+  redmi
+
+After reboot: wait ~60s after unlock — adb-auto-enable re-enables port $ADB_PORT
+automatically. Then redmi works over Tailscale with no USB.
+
+EOF
+}
+
+case "$MODE" in
+  check)
+    check_state
+    exit 0
+    ;;
+  pair)
+    note "pair in browser (over Tailscale): $pair_url"
+    note "phone: Developer options → Wireless debugging → Pair with pairing code"
+    exit 0
+    ;;
+  tailscale)
+    print_tailscale_guide
+    check_state
+    exit 0
+    ;;
+esac
+
+# --- setup mode: use any available ADB path (Tailscale first, then USB) ---
+
+if [[ ! -f "$APK" ]]; then
+  mkdir -p "$(dirname "$APK")"
+  command -v curl >/dev/null 2>&1 || fail "APK missing and curl not found"
+  note "downloading adb-auto-enable ..."
+  curl -fsSL -o "$APK" "$APK_URL"
+fi
+
+adb_serial=""
+if port_open "$ip" "$ADB_PORT"; then
+  adb connect "${ip}:${ADB_PORT}" 2>/dev/null | tr -d '\r' || true
+  if pick_tailscale_adb "$ip" >/dev/null; then
+    adb_serial="${ip}:${ADB_PORT}"
+    ok "using existing Tailscale ADB session"
+  fi
+fi
+
+if [[ -z "$adb_serial" ]]; then
+  usb="$(pick_usb)"
+  if [[ -n "$usb" ]]; then
+    adb_serial="$usb"
+    ok "using USB ADB"
+    note "enabling network ADB on port $ADB_PORT ..."
+    adb -s "$usb" tcpip "$ADB_PORT" >/dev/null
+    sleep 2
+    adb connect "${ip}:${ADB_PORT}" 2>/dev/null | tr -d '\r' || true
+    if pick_tailscale_adb "$ip" >/dev/null; then
+      adb_serial="${ip}:${ADB_PORT}"
+    fi
+  fi
+fi
+
+if [[ -n "$adb_serial" ]]; then
+  note "pushing APK to phone ..."
+  adb -s "$adb_serial" push "$APK" "$apk_on_phone" >/dev/null
+  ok "APK at $apk_on_phone — tap to install on the phone if not already installed"
+
+  if adb -s "$adb_serial" shell pm path "$ADB_AUTO_PKG" 2>/dev/null | grep -q .; then
+    ok "adb-auto-enable already installed"
+  else
+    note "trying adb install (may fail on MIUI without Install via USB) ..."
+    if adb -s "$adb_serial" install -r "$APK" >/dev/null 2>&1; then
+      ok "installed via adb"
+    else
+      note "adb install blocked — tap $apk_on_phone on the phone to install"
+    fi
+  fi
+
+  adb -s "$adb_serial" shell pm grant "$ADB_AUTO_PKG" android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1 || true
+  adb -s "$adb_serial" shell settings put global adb_wifi_enabled 1 >/dev/null 2>&1 || true
+  adb -s "$adb_serial" shell cmd deviceidle whitelist "+${ADB_AUTO_PKG}" >/dev/null 2>&1 || true
+
+  adb -s "$adb_serial" shell monkey -p "$ADB_AUTO_PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+else
+  note "no ADB session (Tailscale port $ADB_PORT closed, no USB)"
+  print_tailscale_guide
+  exit 0
+fi
+
+cat >&2 <<EOF
+
+redmi-adb-setup: finish pairing over Tailscale (no USB needed from here):
+
+  1. Open $pair_url
+  2. Phone → Wireless debugging → Pair with pairing code
+  3. Enter code in web UI → Pair → "Switch Target Port Now"
+  4. Reboot once to verify post-boot auto-enable, then: redmi
+
+EOF
+
+check_state

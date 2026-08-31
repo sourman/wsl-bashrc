@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Patched blueman-applet from ~/work/blueman (see PATCHES.md).
+set -euo pipefail
+
+BLUEMAN_ROOT="${BLUEMAN_ROOT:-/home/ahmed/work/blueman}"
+exec python3 "${BLUEMAN_ROOT}/apps/blueman-applet" "$@"

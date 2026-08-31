@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Wake wireless ADB on port 5555 over Tailscale when post-reboot auto-enable fails.
+#
+# adb-auto-enable finds ADB on WiFi (10.80.x) but skips it when looking for the
+# Tailscale IP. If your PC is on the same LAN as the phone, this script connects
+# via WiFi, runs adb tcpip 5555, then Tailscale ADB works.
+#
+# Usage: redmi-wake
+
+set -euo pipefail
+
+PHONE_HOST="${REDMI_HOST:-redmi}"
+ADB_PORT="${REDMI_ADB_PORT:-5555}"
+LAN_IP="${REDMI_LAN_IP:-}"
+
+fail() { echo "redmi-wake: $*" >&2; exit 1; }
+note() { echo "redmi-wake: $*" >&2; }
+ok()   { echo "redmi-wake: ✓ $*" >&2; }
+
+command -v adb >/dev/null 2>&1 || fail "adb not found"
+command -v tailscale >/dev/null 2>&1 || fail "tailscale not found"
+
+resolve_ts_ip() {
+  if [[ -n "${REDMI_IP:-}" ]]; then echo "$REDMI_IP"; return; fi
+  tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print $1; exit }'
+}
+
+discover_lan_ip() {
+  if [[ -n "$LAN_IP" ]]; then echo "$LAN_IP"; return; fi
+  # Phone WiFi IP from adb-auto-enable logs (mDNS Host line)
+  if curl -fsS --max-time 3 "http://${ts_ip}:9093/api/logs" 2>/dev/null | python3 -c "
+import json,re,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+logs=d.get('logs','')
+m=re.search(r'Host: ([0-9.]+), Port: (\d+)', logs)
+if m:
+    print(m.group(1))
+" 2>/dev/null; then return; fi
+  # Fallback: common campus/home LAN from tailscale direct path in status
+  local direct
+  direct="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host && $0 ~ /direct/ { print $0 }')"
+  if [[ "$direct" == *"10.80."* ]]; then
+    awk '{ for(i=1;i<=NF;i++) if($i ~ /^10\.80\./) { print $i; exit } }' <<<"$direct" | tr -d ','
+  fi
+}
+
+discover_wifi_adb_port() {
+  curl -fsS --max-time 3 "http://${ts_ip}:9093/api/logs" 2>/dev/null | python3 -c "
+import json,re,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+logs=d.get('logs','')
+ports=re.findall(r'Port: (\d+)', logs)
+# ignore 9093/5555 if present; wireless debug ports are ephemeral
+for p in reversed(ports):
+    if int(p) not in (9093, 5555) and int(p) > 32767:
+        print(p)
+        break
+" 2>/dev/null || true
+}
+
+ts_ip="$(resolve_ts_ip)"
+[[ -n "$ts_ip" ]] || fail "could not resolve Tailscale IP for $PHONE_HOST"
+
+if timeout 2 bash -c "echo >/dev/tcp/$ts_ip/$ADB_PORT" 2>/dev/null; then
+  ok "port $ADB_PORT already open on $ts_ip"
+  exit 0
+fi
+
+lan_ip="$(discover_lan_ip || true)"
+[[ -n "$lan_ip" ]] || fail "could not discover phone LAN IP (need same WiFi as phone, or plug USB and run: adb tcpip $ADB_PORT)"
+
+wifi_port="$(discover_wifi_adb_port)"
+[[ -n "$wifi_port" ]] || fail "could not find wireless ADB port in adb-auto-enable logs (open http://${ts_ip}:9093)"
+
+note "phone LAN $lan_ip — connecting to wireless ADB port $wifi_port ..."
+if ! adb connect "${lan_ip}:${wifi_port}" 2>&1 | grep -qiE 'connected|already'; then
+  fail "adb connect ${lan_ip}:${wifi_port} failed (are you on the same WiFi as the phone?)"
+fi
+
+sleep 1
+if ! adb -s "${lan_ip}:${wifi_port}" shell true >/dev/null 2>&1; then
+  fail "ADB session on ${lan_ip}:${wifi_port} not responding"
+fi
+
+note "switching to TCP port $ADB_PORT ..."
+adb -s "${lan_ip}:${wifi_port}" tcpip "$ADB_PORT" >/dev/null
+sleep 2
+
+adb connect "${ts_ip}:${ADB_PORT}" 2>&1 | tr -d '\r' || true
+if timeout 5 adb -s "${ts_ip}:${ADB_PORT}" shell true >/dev/null 2>&1; then
+  ok "Tailscale ADB ready at ${ts_ip}:${ADB_PORT}"
+  exit 0
+fi
+
+fail "tcpip ran but ${ts_ip}:${ADB_PORT} still not up — try: redmi (or plug USB once)"

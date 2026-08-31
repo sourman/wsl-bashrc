@@ -59,7 +59,8 @@ fi
 
 target="${ip}:${ADB_PORT}"
 
-if ! tailscale ping -c 1 -timeout "${PING_TIMEOUT}s" "$ip" >/dev/null 2>&1; then
+ping_out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ip" 2>&1)" || true
+if [[ "$ping_out" != *"pong from"* ]]; then
   fail "cannot reach $PHONE_HOST at $ip over Tailscale (ping timed out after ${PING_TIMEOUT}s). The phone may be asleep or off-network."
 fi
 
@@ -86,4 +87,5 @@ if ! timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1; then
 fi
 
 note "launching scrcpy ..."
-exec scrcpy --tcpip="$target" "$@"
+# Always mirror the physical screen — stale scrcpy virtual displays can cause a blank window.
+exec scrcpy --tcpip="$target" --display-id=0 "$@"

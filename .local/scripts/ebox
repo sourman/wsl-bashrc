@@ -411,7 +411,7 @@ cmd_init() {
   local created snap
   echo "› creating box '$box_name' from seed '$seed_id'…"
   created="$(_ebox_api create "$box_name" --template "$seed_id" \
-    --timeout "$EBOX_TIMEOUT" --port "$EBOX_APP_PORT" --stub-web 1)"
+    --timeout "$EBOX_TIMEOUT" --port "$EBOX_APP_PORT" --stub-web 0)"
   _ebox_register_created "$created"
   echo "› snapshotting as base '$base_name'…"
   snap="$(_ebox_api snapshot "$(jq -r .sandbox_id <<<"$created")" --name "$base_name")"
@@ -477,7 +477,7 @@ cmd_new() {
       [ -n "$snap" ] || die "unknown base '$ref'"
       echo "› creating '$name' from base '$ref'…"
       created="$(_ebox_api create "$name" --snapshot "$snap" --timeout "$timeout" \
-        --port "$port" --stub-web 1)"
+        --port "$port" --stub-web 0)"
       ;;
     box)
       local sid snap
@@ -485,12 +485,12 @@ cmd_new() {
       echo "› snapshotting leaf '$ref' → fork '$name'…"
       snap="$(_ebox_api snapshot "$sid")"
       created="$(_ebox_api create "$name" --snapshot "$(jq -r .snapshot_id <<<"$snap")" \
-        --timeout "$timeout" --port "$port" --stub-web 1)"
+        --timeout "$timeout" --port "$port" --stub-web 0)"
       ;;
     seed)
       echo "› creating '$name' from seed '$ref' (new lineage)…"
       created="$(_ebox_api create "$name" --template "$ref" --timeout "$timeout" \
-        --port "$port" --stub-web 1)"
+        --port "$port" --stub-web 0)"
       ;;
     *) die "bad parent kind: $kind" ;;
   esac
@@ -890,7 +890,7 @@ cmd_wake() {
   port="$(_ebox_get "$name" app_port)"
   port="${port:-$EBOX_APP_PORT}"
   timeout="$(_ebox_project_timeout)"
-  _ebox_api ensure_web "$sid" "$port" >/dev/null
+  # Do not bind a placeholder http.server on app_port — that steals 8080 from Vite/Cora.
   _ebox_ensure_desktop "$name" || true
   # Reset TTL on wake; desktop boxes get hybrid VNC keepalive in background.
   _ebox_api set_timeout "$sid" "$timeout" >/dev/null 2>&1 || true

@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Launch scrcpy to the Redmi over Tailscale ADB.
+#
+# Usage:
+#   redmi              mirror the phone
+#   redmi --no-audio   pass any scrcpy flags through
+#
+# Override target:
+#   REDMI_HOST=redmi REDMI_ADB_PORT=5555 redmi
+#   REDMI_IP=100.83.74.89 redmi
+
+set -euo pipefail
+
+PHONE_HOST="${REDMI_HOST:-redmi}"
+ADB_PORT="${REDMI_ADB_PORT:-5555}"
+ADB_TIMEOUT="${REDMI_ADB_TIMEOUT:-5}"
+PING_TIMEOUT="${REDMI_PING_TIMEOUT:-3}"
+PING_RETRIES="${REDMI_PING_RETRIES:-12}"   # ~60s — cellular handover can take a while
+PING_RETRY_SLEEP="${REDMI_PING_RETRY_SLEEP:-5}"
+ADB_CONNECT_RETRIES="${REDMI_ADB_CONNECT_RETRIES:-18}"   # ~90s — post-reboot auto-enable delay
+ADB_CONNECT_RETRY_SLEEP="${REDMI_ADB_CONNECT_RETRY_SLEEP:-5}"
+TAILSCALE_PKG="com.tailscale.ipn"
+
+fail() {
+  echo "redmi: $*" >&2
+  exit 1
+}
+
+note() {
+  echo "redmi: $*" >&2
+}
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  fail "tailscale is not installed or not on PATH"
+fi
+
+if ! command -v adb >/dev/null 2>&1; then
+  fail "adb is not installed or not on PATH"
+fi
+
+if ! command -v scrcpy >/dev/null 2>&1; then
+  fail "scrcpy is not installed or not on PATH"
+fi
+
+if [[ -n "${REDMI_IP:-}" ]]; then
+  ip="$REDMI_IP"
+  peer_line=""
+else
+  peer_line="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print; exit }' || true)"
+  if [[ -z "$peer_line" ]]; then
+    fail "could not find Tailscale peer '$PHONE_HOST' on your tailnet (is tailscale running?)"
+  fi
+
+  ip="${peer_line%% *}"
+
+  if [[ "$peer_line" == *"offline"* ]]; then
+    last_seen="$(sed -n 's/.*last seen \([^,]*\).*/\1/p' <<<"$peer_line")"
+    if [[ -n "$last_seen" ]]; then
+      fail "$PHONE_HOST ($ip) is offline on Tailscale (last seen $last_seen). Wake the phone and make sure the Tailscale app is running."
+    fi
+    fail "$PHONE_HOST ($ip) is offline on Tailscale. Wake the phone and make sure the Tailscale app is running."
+  fi
+fi
+
+target="${ip}:${ADB_PORT}"
+
+wake_tailscale_over_adb() {
+  local serial
+  while read -r serial; do
+    [[ -n "$serial" ]] || continue
+    adb -s "$serial" shell am broadcast -a com.tailscale.ipn.CONNECT_VPN \
+      -n "${TAILSCALE_PKG}/.IPNReceiver" >/dev/null 2>&1 || true
+  done < <(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" { print $1 }')
+}
+
+tailscale_ping_ok() {
+  # Exit code 1 when only DERP works (no direct path) — check output, not status.
+  local out
+  out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ip" 2>&1)" || true
+  [[ "$out" == *"pong from"* ]]
+}
+
+if ! tailscale_ping_ok; then
+  note "tailscale ping to $ip failed — common after WiFi→mobile handover while the app still shows connected"
+  note "retrying for up to $((PING_RETRIES * PING_RETRY_SLEEP))s ..."
+  woke=0
+  for ((i = 1; i <= PING_RETRIES; i++)); do
+    if tailscale_ping_ok; then
+      note "tailscale path recovered (attempt $i)"
+      break
+    fi
+    if [[ "$woke" -eq 0 ]] && adb devices 2>/dev/null | awk 'NR>1 && $2=="device" { found=1 } END { exit !found }'; then
+      note "nudging Tailscale over any connected ADB session ..."
+      wake_tailscale_over_adb
+      woke=1
+    fi
+    if [[ "$i" -lt "$PING_RETRIES" ]]; then
+      sleep "$PING_RETRY_SLEEP"
+    fi
+  done
+  if ! tailscale_ping_ok; then
+    fail "cannot reach $PHONE_HOST at $ip over Tailscale after retries. On the phone: toggle Tailscale off/on, or toggle airplane mode. Also update Tailscale to 1.99+ (fixes mobile handover) and run: redmi-harden"
+  fi
+fi
+
+ping_detail="$(tailscale ping --until-direct=false -c 1 "$ip" 2>&1 | tail -1 || true)"
+if [[ "$ping_detail" == *"DERP"* ]]; then
+  note "using DERP relay — normal on mobile data; direct path returns on WiFi"
+fi
+
+# Broken /opt/scrcpy installs often omit icons and crash SDL on startup.
+icon_dir="${SCRCPY_ICON_DIR:-$HOME/.local/share/scrcpy-icons}"
+if [[ ! -f "$icon_dir/scrcpy.png" ]]; then
+  mkdir -p "$icon_dir"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$icon_dir/scrcpy.png" \
+      "https://raw.githubusercontent.com/Genymobile/scrcpy/v4.0/app/data/scrcpy.png" \
+      >/dev/null 2>&1 || true
+    curl -fsSL -o "$icon_dir/disconnected.png" \
+      "https://raw.githubusercontent.com/Genymobile/scrcpy/v4.0/app/data/disconnected.png" \
+      >/dev/null 2>&1 || true
+  fi
+fi
+export SCRCPY_ICON_DIR="$icon_dir"
+export SCRCPY_SERVER_PATH="${SCRCPY_SERVER_PATH:-/opt/scrcpy/scrcpy-server}"
+
+pick_usb_serial() {
+  adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /:/ { print $1; exit }'
+}
+
+enable_adb_tcpip_usb() {
+  local usb
+  usb="$(pick_usb_serial)"
+  [[ -n "$usb" ]] || return 1
+  note "USB device $usb attached — running adb tcpip $ADB_PORT ..."
+  if ! adb -s "$usb" tcpip "$ADB_PORT" >/dev/null 2>&1; then
+    return 1
+  fi
+  sleep 2
+  return 0
+}
+
+adb_port_open() {
+  timeout 2 bash -c "echo >/dev/tcp/$ip/$ADB_PORT" 2>/dev/null
+}
+
+adb_session_ok() {
+  timeout "$ADB_TIMEOUT" adb -s "$target" shell true >/dev/null 2>&1
+}
+
+connect_adb() {
+  local attempt=0 usb_attempted=0 wake_attempted=0 out rc=0
+
+  while (( attempt < ADB_CONNECT_RETRIES )); do
+    attempt=$((attempt + 1))
+
+    if adb_session_ok; then
+      return 0
+    fi
+
+    out=""
+    rc=0
+    if ! out="$(timeout "$ADB_TIMEOUT" adb connect "$target" 2>&1)"; then
+      rc=$?
+    fi
+
+    if adb_session_ok; then
+      return 0
+    fi
+
+    if [[ "$rc" -eq 124 ]]; then
+      note "adb connect timed out (attempt $attempt/$ADB_CONNECT_RETRIES) ..."
+    elif [[ "$out" == *"refused"* ]]; then
+      if [[ "$usb_attempted" -eq 0 ]] && enable_adb_tcpip_usb; then
+        usb_attempted=1
+        continue
+      fi
+      if [[ "$wake_attempted" -eq 0 ]] && command -v redmi-wake >/dev/null 2>&1; then
+        wake_attempted=1
+        note "trying LAN wake (same WiFi) via redmi-wake ..."
+        if redmi-wake 2>/dev/null; then
+          continue
+        fi
+      fi
+      if [[ "$attempt" -eq 1 ]]; then
+        note "port $ADB_PORT not listening — post-reboot; try: redmi-wake (same WiFi) or USB"
+      fi
+    elif [[ -n "$out" ]] && [[ "$out" != *"already connected"* ]]; then
+      note "adb connect: ${out##*$'\n'}"
+    fi
+
+    if (( attempt < ADB_CONNECT_RETRIES )); then
+      sleep "$ADB_CONNECT_RETRY_SLEEP"
+    fi
+  done
+
+  return 1
+}
+
+note "connecting to $PHONE_HOST at $target ..."
+
+if ! connect_adb; then
+  fail "ADB on $target never came up. Tailscale works but wireless ADB is off after reboot.
+  • Plug USB once and run: redmi-adb-setup
+  • Or if already paired: wait ~60s after unlock and retry redmi
+  • Quick fix with USB: adb tcpip $ADB_PORT"
+fi
+
+note "launching scrcpy ..."
+exec scrcpy --tcpip="$target" "$@"
