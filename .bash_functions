@@ -734,15 +734,3 @@ bun() {
   fi
   command bun "$@"
 }
-
-# ============================================================================
-# box — remote sticky boxes (Sprites). wt-shaped; does not touch wt.
-# Implementation: ~/.local/bin/box  |  help: box help
-# ============================================================================
-box() { command box "$@"; }
-
-# ============================================================================
-# ebox — E2B boxes with human names. Parallel to `box` (Sprites). Leaves wt alone.
-# Implementation: ~/.local/bin/ebox  |  help: ebox help
-# ============================================================================
-ebox() { command ebox "$@"; }

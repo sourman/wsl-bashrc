@@ -3,6 +3,7 @@
 	email = ahmed.om@gmail.com
 [alias]
 	dbr = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
+    wt = worktree
 	amend = commit --amend
 	meez = diff --color-words
 	meg = diff --color-words --cached

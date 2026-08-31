@@ -234,3 +234,6 @@ export PATH="$HOME/.deno/bin:$PATH"
 
 # The next line updates PATH for the Google Cloud SDK.
 if [ -f '/home/ahmed/google-cloud-sdk/path.bash.inc' ]; then . '/home/ahmed/google-cloud-sdk/path.bash.inc'; fi
+
+# Added by Cap
+export PATH="/home/ahmed/.cap/bin:$PATH"
