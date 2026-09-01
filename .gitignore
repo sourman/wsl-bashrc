@@ -18,6 +18,9 @@
 !.gitignore
 !README.md
 
+# Agents in general
+!.agents
+
 # --- Cursor: do NOT re-include .cursor/ wholesale. The nested
 # .cursor/.gitignore (Cursor-managed) un-ignores plugins/projects/cache,
 # which would leak thousands of files. Instead, explicitly allow ONLY the
