@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "skills": {
+    "grilling": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/mattpocock/skills.git",
+      "skillPath": "skills/productivity/grilling/SKILL.md",
+      "skillFolderHash": "f0732035b8b1b60ae39454e4191caef32fa91903",
+      "pluginName": "mattpocock-skills",
+      "installedAt": "2026-09-01T19:20:33.731Z",
+      "updatedAt": "2026-09-01T19:20:33.731Z"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/mattpocock/skills.git",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "skillFolderHash": "3df14e2d3a89459bf300614be9247e3ce74798f8",
+      "pluginName": "mattpocock-skills",
+      "installedAt": "2026-09-01T19:20:34.123Z",
+      "updatedAt": "2026-09-01T19:20:34.123Z"
+    },
+    "chad-browser": {
+      "source": "sourman/chad-browser",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/sourman/chad-browser.git",
+      "skillPath": "SKILL.md",
+      "skillFolderHash": "d2e4cd6e73379feed334604060ddfc8361d2402f",
+      "installedAt": "2026-09-01T19:21:14.661Z",
+      "updatedAt": "2026-09-01T19:21:14.661Z"
+    }
+  },
+  "dismissed": {}
+}
