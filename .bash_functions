@@ -2,25 +2,8 @@
 # Custom bash functions
 # ============================================================================
 
-# Push to all remotes (never forget a mirror)
-pushy() {
-  git remote | while read remote; do
-    echo "Pushing to $remote..."
-    git push "$remote" "$@"
-  done
-}
-
-# Wrap an XML/HTML tag around a file's contents
-kayes() {
-  local f="$1" tag="$2"
-  { echo "<$tag>"; cat "$f"; echo "</$tag>"; } > "$f.tmp" && mv "$f.tmp" "$f"
-}
-
 # Peek at the last N supabase migrations (default 5)
 rukn() { supabase migration list | tail -"${1:-5}"; }
-
-# Trick Cursor's terminal tool into waiting — it skips bare `sleep N` calls
-holdon() { sleep "$(($1))"; }
 
 # ============================================================================
 # wt — worktree navigator. Jump is the universal default.
@@ -715,11 +698,6 @@ cursor() {
                  --disable-backgrounding-occluded-windows "$@"
 }
 
-
-# Launch claude in z.ai glm mode
-z() {
-    claude --settings ~/.claude/settings.json.zai
-}
 
 # Wrap `bun install`/`add` (incl. -g) with bunr: blocked lifecycle scripts get
 # reviewed by claude — safe auto-trusted, suspicious prompted [y/N], malicious
