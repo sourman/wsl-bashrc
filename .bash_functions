@@ -700,7 +700,7 @@ cursor() {
 
 
 # Wrap `bun install`/`add` (incl. -g) with bunr: blocked lifecycle scripts get
-# reviewed by claude — safe auto-trusted, suspicious prompted [y/N], malicious
+# reviewed by cursor-agent — safe auto-trusted, suspicious prompted [y/N], malicious
 # left blocked. Everything else passes to the real bun unchanged. Interactive
 # shells only, so scripts/tools that invoke bun aren't intercepted.
 # Bypass one call:  BUNR=0 bun add ...   or   command bun add ...

@@ -2,8 +2,8 @@
 # Launch scrcpy to the Pixel 7 over Tailscale ADB.
 #
 # Usage:
-#   pixel              mirror the phone
-#   pixel --no-audio   pass any scrcpy flags through
+#   pixel              mirror the phone (tuned for remote Tailscale: 2M, 800px, 7fps, no audio)
+#   pixel --max-fps=30 pass any scrcpy flags through to override defaults
 #
 # Override target:
 #   PIXEL_HOST=pixel-7 PIXEL_ADB_PORT=5555 pixel
@@ -40,6 +40,8 @@ fi
 if [[ -n "${PIXEL_IP:-}" ]]; then
   ip="$PIXEL_IP"
   peer_line=""
+  target="${ip}:${ADB_PORT}"
+  ping_host="$ip"
 else
   peer_line="$(tailscale status 2>/dev/null | awk -v host="$PHONE_HOST" '$2 == host { print; exit }' || true)"
   if [[ -z "$peer_line" ]]; then
@@ -47,8 +49,12 @@ else
   fi
 
   ip="${peer_line%% *}"
+  target="${PHONE_HOST}:${ADB_PORT}"
+  ping_host="$PHONE_HOST"
 
-  if [[ "$peer_line" == *"offline"* ]]; then
+  # Tailscale status can show "active; direct ...; offline, last seen ..." on one
+  # line. Only treat the peer as offline when it is not active.
+  if [[ "$peer_line" != *"active"* && "$peer_line" == *"offline"* ]]; then
     last_seen="$(sed -n 's/.*last seen \([^,]*\).*/\1/p' <<<"$peer_line")"
     if [[ -n "$last_seen" ]]; then
       fail "$PHONE_HOST ($ip) is offline on Tailscale (last seen $last_seen). Wake the phone and make sure the Tailscale app is running."
@@ -57,9 +63,13 @@ else
   fi
 fi
 
-target="${ip}:${ADB_PORT}"
+# Drop stale IP-based duplicates before connect so adb/scrcpy never see two devices.
+ip_target="${ip}:${ADB_PORT}"
+if [[ "$target" != "$ip_target" ]]; then
+  adb disconnect "$ip_target" >/dev/null 2>&1 || true
+fi
 
-ping_out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ip" 2>&1)" || true
+ping_out="$(tailscale ping --until-direct=false -c 1 -timeout "${PING_TIMEOUT}s" "$ping_host" 2>&1)" || true
 if [[ "$ping_out" != *"pong from"* ]]; then
   fail "cannot reach $PHONE_HOST at $ip over Tailscale (ping timed out after ${PING_TIMEOUT}s). The phone may be asleep or off-network."
 fi
@@ -88,4 +98,4 @@ fi
 
 note "launching scrcpy ..."
 # Always mirror the physical screen — stale scrcpy virtual displays can cause a blank window.
-exec scrcpy --tcpip="$target" --display-id=0 "$@"
+exec scrcpy -s "$target" --display-id=0 -b2M -m800 --max-fps=7 --no-audio "$@"
